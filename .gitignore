@@ -1,2 +1,5 @@
-# .gitignore
 bz_mod_config.json
+dist/
+build/
+*.spec
+__pycache__/
