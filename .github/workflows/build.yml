@@ -30,17 +30,17 @@ jobs:
       - name: Build Executable
         # --collect-all tkinterdnd2 is crucial for the drag-and-drop library to work in the exe
         run: |
-          pyinstaller --noconfirm --onefile --windowed --name "Battlezone Mod Engine" --icon "modman.ico" --add-data "modman.ico;." --add-data "BZONE.ttf;." --add-data "BGM.ttf;." --add-data "bz98.png;." --add-data "bz2.png;." --collect-all tkinterdnd2 cmd.py
+          pyinstaller build.spec
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: Battlezone Mod Engine
-          path: dist/Battlezone Mod Engine.exe
+          name: BZ98R_ModManager
+          path: dist/BZ98R_ModManager.exe
 
       - name: Create Release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/Battlezone Mod Engine.exe
+          files: dist/BZ98R_ModManager.exe
           generate_release_notes: true

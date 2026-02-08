@@ -14,7 +14,7 @@ a = Analysis(
     ['cmd.py'],
     pathex=[],
     binaries=binaries,
-    datas=datas + [('bzone.ttf', '.'), ('modman.ico', '.')],
+    datas=datas + [('BZONE.ttf', '.'), ('BGM.ttf', '.'), ('bz98.png', '.'), ('bz2.png', '.'), ('modman.ico', '.')],
     hiddenimports=hiddenimports + ['PIL.Image', 'PIL.ImageTk'],
     hookspath=[],
     hooksconfig={},

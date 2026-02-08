@@ -761,6 +761,8 @@ class BZModMaster:
             
             completed_count = 0
             
+            last_log_time = 0
+            
             while True:
                 if self.stop_event.is_set():
                     p.terminate()
@@ -774,6 +776,8 @@ class BZModMaster:
                     # Regex for SteamCMD progress: "progress: 23.45"
                     progress_match = re.search(r'progress:\s*(\d+\.\d+)', clean)
                     
+                    current_time = datetime.now().timestamp()
+                    
                     if "Success. Downloaded item" in clean:
                         completed_count += 1
                         self.log(f"Success: {clean.split('item')[-1].strip()} ({completed_count}/{total_items})", "success")
@@ -786,7 +790,13 @@ class BZModMaster:
                     elif "Verifying" in clean:
                         self.root.after(0, lambda c=completed_count, t=total_items: self.dl_btn.config(text=f"VERIFYING {c+1}/{t}..."))
                     elif "Update state" not in clean:
-                        self.log(clean)
+                        # Throttle "Downloading" and "Extracting" spam
+                        if "Downloading" in clean or "Extracting" in clean:
+                            if current_time - last_log_time > 1.0: # Log at most once per second
+                                self.log(clean)
+                                last_log_time = current_time
+                        else:
+                            self.log(clean)
 
             p.wait()
             if p in self.active_processes: self.active_processes.remove(p)
@@ -802,8 +812,14 @@ class BZModMaster:
                         if os.path.exists(dst): shutil.rmtree(dst)
                         shutil.copytree(src, dst)
                     else:
-                        if not os.path.exists(dst): subprocess.run(f'mklink /J "{dst}" "{src}"', shell=True)
-                    self.log(f"Deployed: {mid}", "success")
+                        if not os.path.lexists(dst): 
+                            try:
+                                subprocess.run(f'mklink /J "{dst}" "{src}"', shell=True, timeout=10)
+                            except subprocess.TimeoutExpired:
+                                self.log(f"Link creation timed out for {mid}", "error")
+                            except Exception as e:
+                                self.log(f"Link creation failed for {mid}: {e}", "error")
+                    self.log(f"Deployment complete: {mid}", "success")
             
             self.root.after(0, lambda: self.dl_btn.config(text="DEPLOYED"))
             self.root.after(3000, lambda: self.dl_btn.config(text="INSTALL MOD", state="normal"))
@@ -1030,87 +1046,7 @@ class BZModMaster:
             except Exception as e:
                 self.log(f"Failed to clear cache: {e}", "error")
 
-    def on_tab_change(self, event):
-        """Triggers a refresh only when the Manage Mods tab is selected."""
-        if self.tabs.index("current") == 1:
-            self.refresh_list()
 
-    def refresh_list(self):
-        """Deep scans for Workshop content and verifies Game Path links."""
-        self.tree.delete(*self.tree.get_children())
-        self.log("--- SCANNING MOD DATASETS ---", "info")
-        
-        base_cache = os.path.abspath(self.cache_var.get())
-        game_path = os.path.abspath(self.path_var.get())
-        
-        # SteamCMD nested structure for BZ98R
-        current_appid = self.games[self.current_game_key]["appid"]
-        content_dir = os.path.join(base_cache, "steamapps", "workshop", "content", current_appid)
-        game_mods_dir = os.path.join(game_path, "mods")
-
-        # 1. Path Safety Check
-        if not os.path.exists(content_dir):
-            self.log("Path Error: Steam Workshop content folder not found.", "error")
-            self.log(f"Searching: {content_dir}", "timestamp")
-            return
-
-        # 2. Gather Mod IDs
-        try:
-            mod_ids = [d for d in os.listdir(content_dir) if os.path.isdir(os.path.join(content_dir, d))]
-            self.log(f"Scan found {len(mod_ids)} assets in local cache.", "success")
-        except Exception as e:
-            self.log(f"Directory Access Error: {e}", "error")
-            return
-
-        # 3. Populate Treeview
-        for mid in mod_ids:
-            mod_path = os.path.join(content_dir, mid)
-            # Check if this ID is currently linked in the game's /mods folder
-            link_path = os.path.join(game_mods_dir, mid)
-            
-            # Using lexists to catch symlinks even if the target is broken
-            is_linked = os.path.lexists(link_path)
-            status = "ENABLED" if is_linked else "DISABLED"
-            
-            m_time = os.path.getmtime(mod_path)
-            dt = datetime.fromtimestamp(m_time).strftime('%Y-%m-%d')
-            
-            item = self.tree.insert("", "end", values=("Fetching...", mid, status, "Verifying...", dt))
-            
-            # Row Styling
-            if is_linked:
-                self.tree.item(item, tags=('active',))
-            else:
-                self.tree.item(item, tags=('inactive',))
-
-            # Fire off the corrected background thread
-            threading.Thread(target=self.fetch_mod_info_for_tree, args=(item, mid, dt), daemon=True).start()
-
-        self.update_tree_tags()
-
-    def fetch_mod_info_for_tree(self, item, mid, local_date):
-        """Fetches mod name and checks for updates by comparing local vs workshop dates."""
-        try:
-            url = f"https://steamcommunity.com/sharedfiles/filedetails/?id={mid}"
-            req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-            with urllib.request.urlopen(req) as r:
-                html = r.read().decode('utf-8')
-                
-                name_match = re.search(r'<div class="workshopItemTitle">(.*?)</div>', html)
-                # Look for the date Steam says it was last updated
-                date_match = re.search(r'<(?:div|span) class="detailsStatRight">([^<]+)</(?:div|span)>', html)
-                
-                title = name_match.group(1).strip() if name_match else mid
-                remote_date = date_match.group(1).strip() if date_match else "Unknown"
-                
-                # Check if the local folder is older than the workshop update
-                # For now, we'll just display both; we can add datetime parsing later
-                version_status = f"Remote: {remote_date}"
-                
-                self.root.after(0, lambda: self.tree.set(item, "Name", title))
-                self.root.after(0, lambda: self.tree.set(item, "Version", version_status))
-        except Exception as e:
-            self.root.after(0, lambda: self.tree.set(item, "Name", f"ID: {mid} (Fetch Error)"))
 
     def launch_game(self):
         exe = os.path.join(self.path_var.get(), self.games[self.current_game_key]["exe"])
@@ -1436,8 +1372,11 @@ class BZModMaster:
                     
                     if IS_WINDOWS:
                         # Use Junction (/J) for best compatibility with game engines
-                        subprocess.run(f'mklink /J "{dst}" "{src}"', shell=True, check=True, capture_output=True)
-                        self.log(f"Mod {mid} enabled (Junction created).", "success")
+                        try:
+                            subprocess.run(f'mklink /J "{dst}" "{src}"', shell=True, check=True, capture_output=True, timeout=10)
+                            self.log(f"Mod {mid} enabled (Junction created).", "success")
+                        except subprocess.TimeoutExpired:
+                            self.log(f"Link creation timed out for {mid}", "error")
                     else:
                         # Linux: Use symbolic links
                         os.symlink(src, dst, target_is_directory=True)
