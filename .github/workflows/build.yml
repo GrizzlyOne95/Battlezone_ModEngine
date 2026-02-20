@@ -51,11 +51,13 @@ jobs:
       - name: Package Release (Linux)
         if: runner.os == 'Linux'
         run: |
+          ls -l dist
           tar -czvf BZ98R_ModManager-linux.tar.gz -C dist BZ98R_ModManager
 
       - name: Package Release (macOS)
         if: runner.os == 'macOS'
         run: |
+          ls -l dist
           tar -czvf BZ98R_ModManager-macos.tar.gz -C dist BZ98R_ModManager
 
       - name: Upload Artifact
