@@ -1,4 +1,5 @@
 # -*- mode: python ; coding: utf-8 -*-
+from PyInstaller.utils.hooks import collect_data_files
 
 a = Analysis(
     ['cmd.py'],
@@ -15,13 +16,15 @@ a = Analysis(
         ('LICENSE', '.'),
         ('README.md', '.')
     ],
-    hiddenimports=['PIL', 'tkinterdnd2'],
+    hiddenimports=['PIL'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
     excludes=[],
     noarchive=False,
 )
+a.datas += collect_data_files('tkinterdnd2')
+
 pyz = PYZ(a.pure)
 
 exe = EXE(
@@ -30,7 +33,7 @@ exe = EXE(
     [],
     exclude_binaries=True,
     name='BZ98R_ModManager',
-    debug=False,
+    debug=True,
     bootloader_ignore_signals=False,
     strip=False,
     upx=True,
@@ -40,4 +43,15 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
+)
+
+coll = COLLECT(
+    exe,
+    a.binaries,
+    a.zipfiles,
+    a.datas,
+    strip=False,
+    upx=True,
+    upx_exclude=[],
+    name='BZ98R_ModManager',
 )
