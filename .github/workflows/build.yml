@@ -46,18 +46,16 @@ jobs:
       - name: Package Release (Windows)
         if: runner.os == 'Windows'
         run: |
-          Compress-Archive -Path dist/BZ98R_ModManager.exe -DestinationPath BZ98R_ModManager-windows.zip
+          Compress-Archive -Path dist/BZ98R_ModManager -DestinationPath BZ98R_ModManager-windows.zip
 
       - name: Package Release (Linux)
         if: runner.os == 'Linux'
         run: |
-          ls -l dist
           tar -czvf BZ98R_ModManager-linux.tar.gz -C dist BZ98R_ModManager
 
       - name: Package Release (macOS)
         if: runner.os == 'macOS'
         run: |
-          ls -l dist
           tar -czvf BZ98R_ModManager-macos.tar.gz -C dist BZ98R_ModManager
 
       - name: Upload Artifact
