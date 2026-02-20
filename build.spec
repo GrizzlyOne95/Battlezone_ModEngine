@@ -1,21 +1,24 @@
 # -*- mode: python ; coding: utf-8 -*-
 from PyInstaller.utils.hooks import collect_data_files
 
+datas = [
+    ('BGM.ttf', '.'),
+    ('bz2.png', '.'),
+    ('bz98.png', '.'),
+    ('BZONE.ttf', '.'),
+    ('modman.ico', '.'),
+    ('file_version_info.txt', '.'),
+    ('INSTALL_LINUX_GOG.md', '.'),
+    ('LICENSE', '.'),
+    ('README.md', '.')
+]
+datas += collect_data_files('tkinterdnd2')
+
 a = Analysis(
     ['cmd.py'],
     pathex=[],
     binaries=[],
-    datas=[
-        ('BGM.ttf', '.'),
-        ('bz2.png', '.'),
-        ('bz98.png', '.'),
-        ('BZONE.ttf', '.'),
-        ('modman.ico', '.'),
-        ('file_version_info.txt', '.'),
-        ('INSTALL_LINUX_GOG.md', '.'),
-        ('LICENSE', '.'),
-        ('README.md', '.')
-    ],
+    datas=datas,
     hiddenimports=['PIL'],
     hookspath=[],
     hooksconfig={},
@@ -23,7 +26,6 @@ a = Analysis(
     excludes=[],
     noarchive=False,
 )
-a.datas += collect_data_files('tkinterdnd2')
 
 pyz = PYZ(a.pure)
 
