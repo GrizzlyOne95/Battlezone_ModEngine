@@ -4,19 +4,15 @@ on:
   push:
     branches: [ "main" ]
     tags:
-      - "v*"
-  workflow_dispatch:
+      - "v*"  # Triggers on tags like v1.0, v2.3.4
+  workflow_dispatch:  # Allows manual triggering from GitHub UI
 
 permissions:
   contents: write
 
 jobs:
   build:
-    strategy:
-      matrix:
-        os: [windows-latest, ubuntu-latest, macos-latest]
-    
-    runs-on: ${{ matrix.os }}
+    runs-on: windows-latest
 
     steps:
       - name: Checkout repository
@@ -30,61 +26,20 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
-          pip install pyinstaller
-
-      - name: Install Linux dependencies
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libtk8.6 tk8.6-dev
-
+          pip install Pillow tkinterdnd2 pyinstaller
       - name: Build Executable
+        # --collect-all tkinterdnd2 is crucial for the drag-and-drop library to work in the exe
         run: |
           pyinstaller build.spec
-
-      - name: Package Release (Windows)
-        if: runner.os == 'Windows'
-        run: |
-          Compress-Archive -Path dist/BZ98R_ModManager -DestinationPath BZ98R_ModManager-windows.zip
-
-      - name: Package Release (Linux)
-        if: runner.os == 'Linux'
-        run: |
-          tar -czvf BZ98R_ModManager-linux.tar.gz -C dist BZ98R_ModManager
-
-      - name: Package Release (macOS)
-        if: runner.os == 'macOS'
-        run: |
-          tar -czvf BZ98R_ModManager-macos.tar.gz -C dist BZ98R_ModManager
-
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: BZ98R_ModManager-${{ runner.os }}
-          path: BZ98R_ModManager-*.zip
-          if-no-files-found: ignore
-          
-      - name: Upload Artifact (Tar)
-        uses: actions/upload-artifact@v4
-        with:
-          name: BZ98R_ModManager-${{ runner.os }}
-          path: BZ98R_ModManager-*.tar.gz
-          if-no-files-found: ignore
-
-  release:
-    needs: build
-    runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/')
-    
-    steps:
-      - name: Download all artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: artifacts
+          name: BZ98R_ModManager
+          path: dist/BZ98R_ModManager.exe
 
       - name: Create Release
+        if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: artifacts/**/*
+          files: dist/BZ98R_ModManager.exe
           generate_release_notes: true
