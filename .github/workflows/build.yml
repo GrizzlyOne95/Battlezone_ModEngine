@@ -41,7 +41,7 @@ jobs:
 
       - name: Build Executable
         run: |
-          pyinstaller build.spec --debug all
+          pyinstaller build.spec
 
       - name: Package Release (Windows)
         if: runner.os == 'Windows'

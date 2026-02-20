@@ -30,7 +30,7 @@ exe = EXE(
     [],
     exclude_binaries=True,
     name='BZ98R_ModManager',
-    debug=False,
+    debug=True,
     bootloader_ignore_signals=False,
     strip=False,
     upx=True,
