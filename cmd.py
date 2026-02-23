@@ -689,6 +689,31 @@ class BZModMaster:
             self.progress_label.config(text=f"{int(total_percent)}% (Item {completed_count + 1}/{total_items})")
             self.dl_btn.config(text=f"DL {completed_count + 1}/{total_items} ({int(item_percent)}%)")
 
+    def _abort_download_ui(self):
+        self.dl_btn.config(text="INSTALL MOD", state="normal")
+        self.reset_progress()
+        self.end_task()
+
+    def _prompt_deps_and_start(self, queue, deps, sc_path, cache_path, game_path):
+        try:
+            if deps:
+                if messagebox.askyesno("Dependencies Found", f"This mod requires {len(deps)} other items.\nDownload them as well?"):
+                    queue.extend(deps)
+        except Exception as e:
+            self.log(f"Dependency prompt failed: {e}", "warning")
+
+        use_physical = self.resolve_deploy_mode(game_path, self.use_physical_var.get())
+        if use_physical is None:
+            self._abort_download_ui()
+            return
+
+        self.dl_btn.config(state="disabled", text="ENGINE ACTIVE")
+        self.progress.config(mode="indeterminate")
+        self.progress.start(10)
+        self.progress_label.config(text="INITIALIZING...", fg=self.colors['accent'])
+
+        threading.Thread(target=self.download_logic, args=(queue, sc_path, cache_path, game_path, use_physical), daemon=True).start()
+
     def start_download(self):
         mid = self.sanitize_id(self.mod_id_var.get())
         if not mid: 
@@ -702,29 +727,25 @@ class BZModMaster:
             messagebox.showerror("Validation Error", f"Target Mod ID does not belong to {current_game_name}.\nDownload Aborted.")
             return
 
-        # Dependency Check (Main Thread to allow MessageBox)
         queue = [mid]
-        try:
-            self.dl_btn.config(text="CHECKING DEPS...")
-            self.root.update()
-            deps = self.get_dependencies(mid)
-            if deps:
-                if messagebox.askyesno("Dependencies Found", f"This mod requires {len(deps)} other items.\nDownload them as well?"):
-                    queue.extend(deps)
-        except: pass
-
-        self.dl_btn.config(state="disabled", text="ENGINE ACTIVE")
-        self.progress.config(mode="indeterminate")
-        self.progress.start(10)
-        self.progress_label.config(text="INITIALIZING...", fg=self.colors['accent'])
-        self.start_task()
-        
         sc_path = self.steamcmd_var.get()
         cache_path = self.cache_var.get()
         game_path = self.path_var.get()
-        use_physical = self.use_physical_var.get()
-        
-        threading.Thread(target=self.download_logic, args=(queue, sc_path, cache_path, game_path, use_physical), daemon=True).start()
+        self.dl_btn.config(state="disabled", text="CHECKING DEPS...")
+        self.progress.config(mode="indeterminate")
+        self.progress.start(10)
+        self.progress_label.config(text="CHECKING DEPS...", fg=self.colors['accent'])
+        self.start_task()
+
+        def deps_worker():
+            deps = []
+            try:
+                deps = self.get_dependencies(mid)
+            except Exception as e:
+                self.log(f"Dependency Check Failed: {e}", "warning")
+            self.root.after(0, lambda: self._prompt_deps_and_start(queue, deps, sc_path, cache_path, game_path))
+
+        threading.Thread(target=deps_worker, daemon=True).start()
 
     def download_logic(self, mod_ids, sc_path, cache_path, game_path, use_physical):
         if isinstance(mod_ids, str): mod_ids = [mod_ids]
@@ -807,19 +828,36 @@ class BZModMaster:
                 dst = os.path.normpath(os.path.join(game_path, "mods", mid))
                 
                 if os.path.exists(src):
+                    deployed_ok = False
                     if not os.path.exists(os.path.dirname(dst)): os.makedirs(os.path.dirname(dst))
                     if use_physical:
-                        if os.path.exists(dst): shutil.rmtree(dst)
+                        if os.path.lexists(dst):
+                            self.remove_existing_path(dst)
                         shutil.copytree(src, dst)
+                        deployed_ok = True
                     else:
-                        if not os.path.lexists(dst): 
+                        if not os.path.lexists(dst):
                             try:
-                                subprocess.run(f'mklink /J "{dst}" "{src}"', shell=True, timeout=10)
+                                result = subprocess.run(
+                                    f'mklink /J "{dst}" "{src}"',
+                                    shell=True,
+                                    timeout=10,
+                                    capture_output=True,
+                                    text=True,
+                                    check=True
+                                )
                             except subprocess.TimeoutExpired:
                                 self.log(f"Link creation timed out for {mid}", "error")
+                            except subprocess.CalledProcessError as e:
+                                err = e.stderr.strip() if e.stderr else "Unknown error"
+                                self.log(f"Link creation failed for {mid}: {err}", "error")
                             except Exception as e:
                                 self.log(f"Link creation failed for {mid}: {e}", "error")
-                    self.log(f"Deployment complete: {mid}", "success")
+                        deployed_ok = os.path.lexists(dst)
+                    if deployed_ok:
+                        self.log(f"Deployment complete: {mid}", "success")
+                    else:
+                        self.log(f"Deployment failed: {mid}", "error")
             
             self.root.after(0, lambda: self.dl_btn.config(text="DEPLOYED"))
             self.root.after(3000, lambda: self.dl_btn.config(text="INSTALL MOD", state="normal"))
@@ -951,13 +989,13 @@ class BZModMaster:
         else:
             self.admin_frame.pack(side="top", fill="x", padx=10, pady=5)
             
-        lbl = tk.Label(self.admin_frame, text="⚠ ADMIN RIGHTS REQUIRED FOR JUNCTIONS", 
+        lbl = tk.Label(self.admin_frame, text="⚠ ADMIN OR NTFS REQUIRED FOR JUNCTIONS", 
                        bg="#330000", fg="#ff5555", font=("Consolas", 10, "bold"))
         lbl.pack(side="left", padx=10)
         
         btn = ttk.Button(self.admin_frame, text="RELAUNCH AS ADMIN", command=self.relaunch_admin)
         btn.pack(side="right", padx=5, pady=2)
-        ToolTip(lbl, "Windows requires Administrator privileges to create 'Junction' links.\nWithout this, mods cannot be linked to the game folder.")
+        ToolTip(lbl, "Windows requires NTFS to create junctions.\nIf your game is on exFAT, use Physical Copy or move to NTFS.")
 
     def relaunch_admin(self):
         try:
@@ -1354,11 +1392,14 @@ class BZModMaster:
         mods_to_enable = [str(self.tree.item(item)['values'][1]) for item in selected]
         cache_path = self.cache_var.get()
         game_path = self.path_var.get()
-        
-        self.start_task()
-        threading.Thread(target=self._enable_mod_worker, args=(mods_to_enable, cache_path, game_path), daemon=True).start()
+        use_physical = self.resolve_deploy_mode(game_path, self.use_physical_var.get())
+        if use_physical is None:
+            return
 
-    def _enable_mod_worker(self, mods, cache_path, game_path):
+        self.start_task()
+        threading.Thread(target=self._enable_mod_worker, args=(mods_to_enable, cache_path, game_path, use_physical), daemon=True).start()
+
+    def _enable_mod_worker(self, mods, cache_path, game_path, use_physical):
         try:
             for mid in mods:
                 if self.stop_event.is_set(): break
@@ -1368,19 +1409,35 @@ class BZModMaster:
                 
                 try:
                     if not os.path.exists(os.path.dirname(dst)): os.makedirs(os.path.dirname(dst))
-                    if os.path.lexists(dst): continue
-                    
-                    if IS_WINDOWS:
-                        # Use Junction (/J) for best compatibility with game engines
-                        try:
-                            subprocess.run(f'mklink /J "{dst}" "{src}"', shell=True, check=True, capture_output=True, timeout=10)
-                            self.log(f"Mod {mid} enabled (Junction created).", "success")
-                        except subprocess.TimeoutExpired:
-                            self.log(f"Link creation timed out for {mid}", "error")
+                    if use_physical:
+                        if os.path.lexists(dst):
+                            self.remove_existing_path(dst)
+                        shutil.copytree(src, dst)
+                        self.log(f"Mod {mid} enabled (Physical Copy).", "success")
                     else:
-                        # Linux: Use symbolic links
-                        os.symlink(src, dst, target_is_directory=True)
-                        self.log(f"Mod {mid} enabled (Symlink created).", "success")
+                        if os.path.lexists(dst):
+                            continue
+                        if IS_WINDOWS:
+                            # Use Junction (/J) for best compatibility with game engines
+                            try:
+                                subprocess.run(
+                                    f'mklink /J "{dst}" "{src}"',
+                                    shell=True,
+                                    check=True,
+                                    capture_output=True,
+                                    timeout=10,
+                                    text=True
+                                )
+                                self.log(f"Mod {mid} enabled (Junction created).", "success")
+                            except subprocess.TimeoutExpired:
+                                self.log(f"Link creation timed out for {mid}", "error")
+                            except subprocess.CalledProcessError as e:
+                                err = e.stderr.strip() if e.stderr else "Unknown error"
+                                self.log(f"Link creation failed for {mid}: {err}", "error")
+                        else:
+                            # Linux: Use symbolic links
+                            os.symlink(src, dst, target_is_directory=True)
+                            self.log(f"Mod {mid} enabled (Symlink created).", "success")
                 except Exception as e:
                     self.log(f"Link Error for {mid}: {e}", "error")
         finally:
@@ -1426,6 +1483,89 @@ class BZModMaster:
             return bool(os.path.isdir(path) and (ctypes.windll.kernel32.GetFileAttributesW(path) & 0x400))
         else:
             return os.path.islink(path)
+
+    def get_fs_type(self, path):
+        if not IS_WINDOWS or not ctypes or not path:
+            return None
+        try:
+            drive = os.path.splitdrive(os.path.abspath(path))[0]
+            if not drive:
+                return None
+            root = drive + "\\"
+            fs_name_buf = ctypes.create_unicode_buffer(255)
+            serial = ctypes.c_ulong()
+            max_comp = ctypes.c_ulong()
+            flags = ctypes.c_ulong()
+            res = ctypes.windll.kernel32.GetVolumeInformationW(
+                root,
+                None,
+                0,
+                ctypes.byref(serial),
+                ctypes.byref(max_comp),
+                ctypes.byref(flags),
+                fs_name_buf,
+                ctypes.sizeof(fs_name_buf)
+            )
+            if res:
+                return fs_name_buf.value
+        except Exception:
+            pass
+        return None
+
+    def junction_supported(self, path):
+        if not IS_WINDOWS:
+            return True, None
+        fs = self.get_fs_type(path)
+        if not fs:
+            return True, None
+        return (fs.upper() == "NTFS"), fs
+
+    def resolve_deploy_mode(self, game_path, use_physical):
+        if use_physical:
+            return True
+        if not game_path:
+            messagebox.showerror("Game Path Required", "Please select your Game Installation folder so mods can be installed.")
+            return None
+        ok, fs = self.junction_supported(game_path)
+        if ok:
+            return False
+
+        fs_name = fs if fs else "Unknown"
+        msg = (
+            "Your Game Path is on a filesystem that cannot create Junction links.\n\n"
+            f"Detected: {fs_name}\n\n"
+            "Solutions:\n"
+            "• Use Physical Copy (recommended)\n"
+            "• Move the game to an NTFS drive\n"
+            "• Change the Mod Cache / Game Path to an NTFS drive\n\n"
+            "Enable Physical Copy now?"
+        )
+        result = messagebox.askyesnocancel("Junctions Not Supported", msg)
+        if result is None:
+            self.log("Deployment cancelled by user.", "warning")
+            return None
+        if result:
+            self.use_physical_var.set(True)
+            self.save_config()
+            self.log("Switched to Physical Copy mode due to non-NTFS game drive.", "warning")
+            return True
+        self.log("Deployment aborted: Junctions not supported on game drive.", "error")
+        return None
+
+    def remove_existing_path(self, path):
+        try:
+            if not os.path.lexists(path):
+                return
+            if IS_WINDOWS and self.is_junction(path):
+                os.rmdir(path)
+            elif os.path.islink(path):
+                os.unlink(path)
+            elif os.path.isdir(path):
+                shutil.rmtree(path)
+            else:
+                os.remove(path)
+        except Exception as e:
+            self.log(f"Failed to remove existing path: {path} ({e})", "warning")
     def update_all_mods(self):
         """Batch triggers SteamCMD for every item currently in the list."""
         items = self.tree.get_children()
@@ -1447,7 +1587,9 @@ class BZModMaster:
         sc_path = self.steamcmd_var.get()
         cache_path = self.cache_var.get()
         game_path = self.path_var.get()
-        use_physical = self.use_physical_var.get()
+        use_physical = self.resolve_deploy_mode(game_path, self.use_physical_var.get())
+        if use_physical is None:
+            return
         
         for mid in to_update:
             self.start_task()
@@ -1504,6 +1646,10 @@ class BZModMaster:
         """Triggers a re-download via SteamCMD for the selected mods."""
         selected = self.tree.selection()
         if not selected: return
+        game_path = self.path_var.get()
+        use_physical = self.resolve_deploy_mode(game_path, self.use_physical_var.get())
+        if use_physical is None:
+            return
         for item in selected:
             mid = str(self.tree.item(item)['values'][1])
             
@@ -1515,8 +1661,6 @@ class BZModMaster:
             
             sc_path = self.steamcmd_var.get()
             cache_path = self.cache_var.get()
-            game_path = self.path_var.get()
-            use_physical = self.use_physical_var.get()
             
             self.start_task()
             threading.Thread(target=self.download_logic, args=(mid, sc_path, cache_path, game_path, use_physical), daemon=True).start()
