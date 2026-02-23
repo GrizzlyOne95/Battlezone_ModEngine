@@ -11,10 +11,11 @@ A cross-platform tool to download and manage Steam Workshop mods for non-Steam v
 
 
 ## Features
-*   **Steam Workshop Integration**: Downloads mods using SteamCMD. No credentials or login are needed. 
+*   **Steam Workshop Integration**: Downloads mods using SteamCMD. No credentials or login are needed.
 *   **Multi-Game Support**: Supports both **Battlezone 98 Redux** and **Battlezone Combat Commander**.
 *   **Mod Management**: Enable, disable, update, or delete mods via a GUI.
 *   **Smart Linking**: Uses Windows Junctions or Linux symlinks to link mods to the game folder without duplicating files.
+*   **Physical Copy Fallback**: Automatically switches to Physical Copy when junctions are not supported.
 *   **Auto-Detection**: Locates GOG, Heroic, and Steam installations automatically on both Windows and Linux.
 *   **Cross-Platform**: Works on Windows 10/11 and Linux (tested with Arch).
 
@@ -41,10 +42,10 @@ python cmd.py
 
 ### Windows
 *   **From Source**: Install dependencies (`pip install Pillow tkinterdnd2`) and run `cmd.py`.
-*   **Run as Administrator** (required for creating Junction links on Windows).
+*   **Junctions require NTFS**. If your game is on exFAT or FAT32, the app will offer a Physical Copy fallback.
 
 ## Usage
-1.  Run the application (as Administrator on Windows, normal user on Linux).
+1.  Run the application (normal user is fine on Windows and Linux).
 2.  **Downloader Tab**:
     *   Ensure Game Path and SteamCMD paths are correct.
     *   Paste a Steam Workshop URL or ID. You can also drag a link from Steam right into the box!
@@ -57,3 +58,4 @@ python cmd.py
 *   **Windows SmartScreen**: If Windows blocks the app, click **More info** → **Run anyway**. This occurs because the executable is not digitally signed.
 *   **Linux**: Make sure your user has permission to create symlinks (usually enabled by default).
 *   **Heroic Games Launcher**: Install games through Heroic, and the tool will auto-detect the installation path.
+*   **External Drives (Windows)**: Junctions only work on NTFS. If your game is on exFAT, choose the Physical Copy fallback or move the game to an NTFS drive.
