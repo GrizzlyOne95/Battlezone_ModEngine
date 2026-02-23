@@ -9,6 +9,8 @@ on:
 
 permissions:
   contents: write
+  id-token: write
+  attestations: write
 
 jobs:
   build:
@@ -57,6 +59,13 @@ jobs:
         if: runner.os == 'macOS'
         run: |
           tar -czvf BZ98R_ModManager-macos.tar.gz -C dist BZ98R_ModManager
+
+      - name: Attest Build Provenance
+        uses: actions/attest-build-provenance@v1
+        with:
+          subject-path: |
+            BZ98R_ModManager-*.zip
+            BZ98R_ModManager-*.tar.gz
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
