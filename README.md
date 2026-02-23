@@ -44,6 +44,9 @@ python cmd.py
 *   **From Source**: Install dependencies (`pip install Pillow tkinterdnd2`) and run `cmd.py`.
 *   **Junctions require NTFS**. If your game is on exFAT or FAT32, the app will offer a Physical Copy fallback.
 
+## Release Integrity (Attestations)
+Official releases include build attestations to maximize user trust. You can verify attestations on the GitHub Releases page for each version, or build from source using `cmd.py` and the instructions above.
+
 ## Usage
 1.  Run the application (normal user is fine on Windows and Linux).
 2.  **Downloader Tab**:
