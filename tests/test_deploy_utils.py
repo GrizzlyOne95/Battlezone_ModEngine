@@ -33,11 +33,13 @@ class DeployUtilsTests(unittest.TestCase):
                 "exe": "battlezone98redux.exe",
             }
         }
-        context = build_game_context(games, "BZ98R", r"C:\Games\BZ98R")
-        self.assertEqual(context["name"], "Battlezone 98 Redux")
-        self.assertEqual(context["appid"], "301650")
-        self.assertEqual(context["exe"], "battlezone98redux.exe")
-        self.assertTrue(context["game_path"].endswith(os.path.join("Games", "BZ98R")))
+        with tempfile.TemporaryDirectory() as temp_dir:
+            game_dir = os.path.join(temp_dir, "Games", "BZ98R")
+            context = build_game_context(games, "BZ98R", game_dir)
+            self.assertEqual(context["name"], "Battlezone 98 Redux")
+            self.assertEqual(context["appid"], "301650")
+            self.assertEqual(context["exe"], "battlezone98redux.exe")
+            self.assertEqual(context["game_path"], os.path.abspath(game_dir))
 
     def test_build_mod_cache_path_uses_expected_structure(self):
         cache_root = os.path.join("cache")
