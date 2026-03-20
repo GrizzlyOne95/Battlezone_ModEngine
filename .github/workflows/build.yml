@@ -16,7 +16,7 @@ jobs:
   build:
     strategy:
       matrix:
-        os: [windows-latest, ubuntu-latest, macos-latest]
+        os: [windows-latest, ubuntu-latest]
     
     runs-on: ${{ matrix.os }}
 
@@ -34,6 +34,10 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
           pip install pyinstaller
+
+      - name: Run tests
+        run: |
+          python -m unittest discover -s tests
 
       - name: Install Linux dependencies
         if: runner.os == 'Linux'
@@ -54,11 +58,6 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           tar -czvf BZ98R_ModManager-linux.tar.gz -C dist BZ98R_ModManager
-
-      - name: Package Release (macOS)
-        if: runner.os == 'macOS'
-        run: |
-          tar -czvf BZ98R_ModManager-macos.tar.gz -C dist BZ98R_ModManager
 
       - name: Attest Build Provenance
         uses: actions/attest-build-provenance@v1
