@@ -6,6 +6,7 @@ datas = [
     ('bz2.png', '.'),
     ('bz98.png', '.'),
     ('BZONE.ttf', '.'),
+    ('branding/app_icon.ico', 'branding'),
     ('branding/app_icon.png', 'branding'),
     ('file_version_info.txt', '.'),
     ('INSTALL_LINUX_GOG.md', '.'),
@@ -45,7 +46,7 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon='branding/app_icon.png',
+    icon='branding/app_icon.ico',
 )
 
 coll = COLLECT(

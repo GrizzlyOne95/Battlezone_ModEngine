@@ -79,6 +79,58 @@ STEAMCMD_URL = "https://steamcdn-a.akamaihd.net/client/installer/steamcmd.zip"
 CONFIG_FILE = "bz_mod_config.json"
 CACHE_MARKER_FILE = ".bz_mod_cache"
 HTTP_TIMEOUT = 15
+APP_USER_MODEL_ID = "GrizzlyOne95.Battlezone.ModEngine"
+
+
+def _set_app_user_model_id():
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes as _ctypes
+
+        _ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(APP_USER_MODEL_ID)
+    except Exception:
+        pass
+
+
+def _resolve_bundled_icon(name):
+    """Locate a bundled icon working from source and under sys._MEIPASS."""
+    candidates = []
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        candidates.append(os.path.join(meipass, "branding", name))
+        candidates.append(os.path.join(meipass, name))
+    here = os.path.dirname(os.path.abspath(__file__))
+    candidates.append(os.path.join(here, "branding", name))
+    candidates.append(os.path.join(here, name))
+    for path in candidates:
+        if os.path.exists(path):
+            return path
+    return None
+
+
+def apply_window_icon(window):
+    """Apply the canonical app icon to a Tk/Toplevel window."""
+    try:
+        ico_path = _resolve_bundled_icon("app_icon.ico")
+        if ico_path:
+            try:
+                window.iconbitmap(ico_path)
+            except Exception:
+                pass
+        png_path = _resolve_bundled_icon("app_icon.png")
+        if png_path:
+            try:
+                image = tk.PhotoImage(file=png_path)
+                window.iconphoto(True, image)
+                window._battlezone_app_icon = image
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
+_set_app_user_model_id()
 
 class ToolTip:
     def __init__(self, widget, text, bg="#1a1a1a", fg="#00ffff"):
@@ -156,10 +208,7 @@ class BZModMaster:
         self.load_custom_fonts()
         self.load_game_icons()
 
-        icon_path = os.path.join(self.resource_dir, "modman.ico")
-        if os.path.exists(icon_path):
-            try: self.root.iconbitmap(icon_path)
-            except: pass
+        apply_window_icon(self.root)
 
         self.bin_dir = os.path.join(self.base_dir, "bin")
         self.config = self.load_config()
