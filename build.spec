@@ -1,5 +1,9 @@
 # -*- mode: python ; coding: utf-8 -*-
+import os
+
 from PyInstaller.utils.hooks import collect_data_files
+
+version_file = 'branding/version_info.txt' if os.path.exists('branding/version_info.txt') else None
 
 datas = [
     ('BGM.ttf', '.'),
@@ -8,7 +12,6 @@ datas = [
     ('BZONE.ttf', '.'),
     ('branding/app_icon.ico', 'branding'),
     ('branding/app_icon.png', 'branding'),
-    ('file_version_info.txt', '.'),
     ('INSTALL_LINUX_GOG.md', '.'),
     ('LICENSE', '.'),
     ('README.md', '.')
@@ -35,7 +38,7 @@ exe = EXE(
     a.scripts,
     [],
     exclude_binaries=True,
-    name='BZ98R_ModManager',
+    name='BZModEngine',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -47,6 +50,7 @@ exe = EXE(
     codesign_identity=None,
     entitlements_file=None,
     icon='branding/app_icon.ico',
+    version=version_file,
 )
 
 coll = COLLECT(
@@ -57,5 +61,5 @@ coll = COLLECT(
     strip=False,
     upx=True,
     upx_exclude=[],
-    name='BZ98R_ModManager',
+    name='BZModEngine',
 )
