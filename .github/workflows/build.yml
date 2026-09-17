@@ -45,6 +45,10 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libtk8.6 tk8.6-dev
 
+      - name: Generate canonical app icon
+        run: |
+          python scripts/generate_app_icon.py branding/repo_icon.svg branding/app_icon.ico --png branding/app_icon.png
+
       - name: Build Executable
         run: |
           pyinstaller build.spec
