@@ -6,7 +6,7 @@ datas = [
     ('bz2.png', '.'),
     ('bz98.png', '.'),
     ('BZONE.ttf', '.'),
-    ('modman.ico', '.'),
+    ('branding/app_icon.png', 'branding'),
     ('file_version_info.txt', '.'),
     ('INSTALL_LINUX_GOG.md', '.'),
     ('LICENSE', '.'),
@@ -22,7 +22,7 @@ a = Analysis(
     hiddenimports=['PIL'],
     hookspath=[],
     hooksconfig={},
-    runtime_hooks=[],
+    runtime_hooks=['branding/pyinstaller_icon_hook.py'],
     excludes=[],
     noarchive=False,
 )
@@ -45,6 +45,7 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
+    icon='branding/app_icon.png',
 )
 
 coll = COLLECT(
