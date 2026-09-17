@@ -17,7 +17,7 @@ jobs:
     strategy:
       matrix:
         os: [windows-latest, ubuntu-latest]
-    
+
     runs-on: ${{ matrix.os }}
 
     steps:
@@ -49,46 +49,59 @@ jobs:
         run: |
           python scripts/generate_app_icon.py branding/repo_icon.svg branding/app_icon.ico --png branding/app_icon.png
 
-      - name: Build Executable
+      - name: Generate Windows version metadata
+        if: runner.os == 'Windows'
+        run: |
+          python scripts/generate_version_info.py --version "${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || '0.0.0' }}" --output branding/version_info.txt
+
+      - name: Build executable bundle
         run: |
           pyinstaller build.spec
 
-      - name: Package Release (Windows)
+      - name: Package release (Windows)
         if: runner.os == 'Windows'
+        shell: pwsh
         run: |
-          Compress-Archive -Path dist/BZ98R_ModManager -DestinationPath BZ98R_ModManager-windows.zip
+          $archive = "Battlezone_ModEngine-${env:GITHUB_REF_NAME}-windows.zip"
+          Compress-Archive -Path dist/BZModEngine -DestinationPath $archive -Force
+          Get-Item $archive
 
-      - name: Package Release (Linux)
+      - name: Package release (Linux)
         if: runner.os == 'Linux'
+        shell: bash
         run: |
-          tar -czvf BZ98R_ModManager-linux.tar.gz -C dist BZ98R_ModManager
+          set -euo pipefail
+          tar -czf "Battlezone_ModEngine-${GITHUB_REF_NAME}-linux.tar.gz" -C dist BZModEngine
+          ls -lh "Battlezone_ModEngine-${GITHUB_REF_NAME}-linux.tar.gz"
 
-      - name: Attest Build Provenance
+      - name: Attest build provenance
         uses: actions/attest-build-provenance@v1
         with:
           subject-path: |
-            BZ98R_ModManager-*.zip
-            BZ98R_ModManager-*.tar.gz
+            Battlezone_ModEngine-*.zip
+            Battlezone_ModEngine-*.tar.gz
 
-      - name: Upload Artifact
+      - name: Upload Windows artifact
+        if: runner.os == 'Windows'
         uses: actions/upload-artifact@v4
         with:
-          name: BZ98R_ModManager-${{ runner.os }}
-          path: BZ98R_ModManager-*.zip
-          if-no-files-found: ignore
-          
-      - name: Upload Artifact (Tar)
+          name: Battlezone_ModEngine-windows
+          path: Battlezone_ModEngine-*-windows.zip
+          if-no-files-found: error
+
+      - name: Upload Linux artifact
+        if: runner.os == 'Linux'
         uses: actions/upload-artifact@v4
         with:
-          name: BZ98R_ModManager-${{ runner.os }}
-          path: BZ98R_ModManager-*.tar.gz
-          if-no-files-found: ignore
+          name: Battlezone_ModEngine-linux
+          path: Battlezone_ModEngine-*-linux.tar.gz
+          if-no-files-found: error
 
   release:
     needs: build
     runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/')
-    
+    if: startsWith(github.ref, 'refs/tags/v')
+
     steps:
       - name: Download all artifacts
         uses: actions/download-artifact@v4
@@ -98,5 +111,8 @@ jobs:
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
-          files: artifacts/**/*
+          files: |
+            artifacts/Battlezone_ModEngine-windows/Battlezone_ModEngine-v*-windows.zip
+            artifacts/Battlezone_ModEngine-linux/Battlezone_ModEngine-v*-linux.tar.gz
+          fail_on_unmatched_files: true
           generate_release_notes: true

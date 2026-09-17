@@ -2,13 +2,35 @@
 
 A cross-platform tool to download and manage Steam Workshop mods for non-Steam versions of Battlezone 98 Redux or Battlezone Combat Commander.
 
+## Release Builds
+
+Download the latest platform archive from the GitHub Releases page. Packaged application names are intentionally stable and versionless:
+
+- Windows launcher: `BZModEngine.exe`
+- Linux launcher: `BZModEngine`
+- Application folder: `BZModEngine`
+
+Release archives carry the version and platform, for example:
+
+- `Battlezone_ModEngine-v1.0.10-windows.zip`
+- `Battlezone_ModEngine-v1.0.10-linux.tar.gz`
+
+Official Windows builds use the shared **Battlezone Modding Tools** product identity:
+
+```text
+FileDescription: Battlezone Mod Engine
+ProductName: Battlezone Modding Tools
+CompanyName: GrizzlyOne95
+OriginalFilename: BZModEngine.exe
+```
+
+`FileVersion` and `ProductVersion` are derived from the release tag. Non-release CI builds use neutral `0.0.0` Windows metadata.
+
 <img width="1727" height="1323" alt="image" src="https://github.com/user-attachments/assets/3aeebf39-91f9-4ae7-9fc9-6dcdfd7ac581" />
 
 <img width="1727" height="1323" alt="image" src="https://github.com/user-attachments/assets/8eed08c4-f078-4f96-aa69-b0173857f1cd" />
 
-
 <img width="1727" height="1323" alt="image" src="https://github.com/user-attachments/assets/e9e4b5a1-f72f-468a-882c-060898b340a9" />
-
 
 ## Features
 *   **Steam Workshop Integration**: Downloads mods using SteamCMD. No credentials or login are needed.
