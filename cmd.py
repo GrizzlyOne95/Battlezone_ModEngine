@@ -1154,7 +1154,12 @@ class BZModMaster:
 
             self.path_var.set(new_path)
             self.path_entry.configure(foreground=self.colors['accent']) # Reset color
-            self.save_config()
+            if self.is_valid_game_install(new_path):
+                self.auto_detect_game()
+            else:
+                self.game_install_sources[self.current_game_key] = "configured"
+                self.game_workshop_dirs[self.current_game_key] = ""
+                self.save_config()
             self.log(f"Game path updated: {p}", "success")
 
     def browse_steamcmd(self): 
