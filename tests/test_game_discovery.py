@@ -5,7 +5,9 @@ import unittest
 from game_discovery import (
     discover_game_install,
     discover_steam_game,
+    discover_windows_gog_game,
     extract_steam_library_paths,
+    get_windows_gog_paths,
     get_windows_steam_roots,
     is_valid_game_path,
     parse_appmanifest_install_dir,
@@ -157,6 +159,87 @@ class GameDiscoveryTests(unittest.TestCase):
         })
         roots = get_windows_steam_roots(fake_registry, env={"ProgramFiles": r"C:\Program Files"})
         self.assertIn(os.path.normpath(r"C:\Steam"), roots)
+
+    def test_windows_gog_registry_paths_support_game_ids(self):
+        game = {
+            "gog_ids": ["1454067812", "1459427445"],
+            "exe": "battlezone98redux.exe",
+        }
+        fake_registry = FakeWinreg({
+            ("HKLM", r"SOFTWARE\GOG.com\Games\1459427445"): {"path": r"D:\GOG\Battlezone 98 Redux"},
+        })
+        paths = get_windows_gog_paths(game, fake_registry)
+        self.assertIn(os.path.normpath(r"D:\GOG\Battlezone 98 Redux"), paths)
+
+    def test_windows_gog_legacy_wow6432node_path_is_supported(self):
+        game = {
+            "gog_ids": ["1193046833"],
+            "exe": "battlezone2.exe",
+        }
+        fake_registry = FakeWinreg({
+            ("HKLM", r"SOFTWARE\WOW6432Node\GOG.com\Games\1193046833"): {
+                "path": r"E:\GOG\Battlezone Combat Commander"
+            },
+        })
+        paths = get_windows_gog_paths(game, fake_registry)
+        self.assertIn(os.path.normpath(r"E:\GOG\Battlezone Combat Commander"), paths)
+
+    def test_discovers_valid_gog_install_and_reports_source(self):
+        game = {
+            "name": "Battlezone 98 Redux",
+            "appid": "301650",
+            "gog_ids": ["1454067812"],
+            "exe": "battlezone98redux.exe",
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            install_dir = os.path.join(temp_dir, "GOG", "Battlezone 98 Redux")
+            os.makedirs(install_dir)
+            open(os.path.join(install_dir, "battlezone98redux.exe"), "wb").close()
+
+            fake_registry = FakeWinreg({
+                ("HKLM", r"SOFTWARE\GOG.com\Games\1454067812"): {"path": install_dir},
+            })
+            result = discover_windows_gog_game(game, fake_registry)
+            self.assertIsNotNone(result)
+            self.assertEqual(result.source, "gog")
+            self.assertEqual(result.path, os.path.normpath(install_dir))
+
+    def test_invalid_gog_registry_path_is_ignored(self):
+        game = {
+            "gog_ids": ["1454067812"],
+            "exe": "battlezone98redux.exe",
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            fake_registry = FakeWinreg({
+                ("HKLM", r"SOFTWARE\GOG.com\Games\1454067812"): {"path": temp_dir},
+            })
+            self.assertIsNone(discover_windows_gog_game(game, fake_registry))
+
+    def test_unified_windows_discovery_falls_back_to_gog_after_steam(self):
+        game = {
+            "name": "Battlezone Combat Commander",
+            "appid": "624970",
+            "gog_ids": ["1193046833"],
+            "exe": "battlezone2.exe",
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            install_dir = os.path.join(temp_dir, "GOG", "Battlezone Combat Commander")
+            os.makedirs(install_dir)
+            open(os.path.join(install_dir, "battlezone2.exe"), "wb").close()
+
+            fake_registry = FakeWinreg({
+                ("HKLM", r"SOFTWARE\GOG.com\Games\1193046833"): {"path": install_dir},
+            })
+            result = discover_game_install(
+                game,
+                configured_path=os.path.join(temp_dir, "missing"),
+                is_windows=True,
+                winreg_module=fake_registry,
+                env={},
+            )
+            self.assertIsNotNone(result)
+            self.assertEqual(result.source, "gog")
+            self.assertEqual(result.path, os.path.normpath(install_dir))
 
 
 if __name__ == "__main__":
