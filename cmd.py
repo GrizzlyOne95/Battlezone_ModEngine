@@ -28,7 +28,12 @@ from deploy_utils import (
     normalize_path as util_normalize_path,
     paths_match as util_paths_match,
 )
-from game_discovery import discover_game_install, is_valid_game_path
+from game_discovery import (
+    discover_game_install,
+    format_install_status,
+    get_install_source_label,
+    is_valid_game_path,
+)
 from platform_utils import (
     get_default_steamcmd_path as util_get_default_steamcmd_path,
     get_popen_output_kwargs as util_get_popen_output_kwargs,
@@ -234,7 +239,8 @@ class BZModMaster:
         self.path_var = tk.StringVar(value=saved_path)
         self.steamcmd_var = tk.StringVar(value=self.config.get("steamcmd_path", ""))
         self.cache_var = tk.StringVar(value=self.config.get("cache_path", os.path.join(self.base_dir, "workshop_cache")))
-        
+        self.workshop_var = tk.StringVar(value="")
+
         self.mod_id_var = tk.StringVar()
         self.image_cache = {}
         self.is_valid_mod = False
@@ -436,6 +442,32 @@ class BZModMaster:
         self.icon_label.pack(side="left", padx=5)
         self.update_game_icon()
 
+        # Concise install status. This is the primary configuration surface in Simple Mode.
+        status_row = ttk.Frame(cfg)
+        status_row.grid(row=1, column=0, columnspan=6, sticky="ew", pady=(0, 8))
+        ttk.Label(status_row, text="INSTALL STATUS:", font=(self.current_font, 10, "bold")).pack(side="left")
+        self.install_status_label = ttk.Label(
+            status_row,
+            text="Not Detected",
+            foreground="#ff4444",
+            font=("Consolas", 10, "bold"),
+        )
+        self.install_status_label.pack(side="left", padx=(8, 12))
+        self.simple_detect_btn = ttk.Button(
+            status_row,
+            text="DETECT",
+            width=10,
+            command=lambda: self.auto_detect_game(verbose=True),
+        )
+        self.simple_detect_btn.pack(side="left", padx=(0, 5))
+        self.simple_browse_btn = ttk.Button(
+            status_row,
+            text="BROWSE",
+            width=10,
+            command=self.browse_game,
+        )
+        self.simple_browse_btn.pack(side="left")
+
         # Path Rows
         paths = [
             ("Game Path:", self.path_var, self.browse_game, "path_entry", 
@@ -448,7 +480,7 @@ class BZModMaster:
 
         self.path_ui_elements = []
         for i, (txt, var, cmd, attr, tip) in enumerate(paths):
-            row_idx = i + 1
+            row_idx = i + 2
             widgets = {'default_text': txt}
             
             l = ttk.Label(cfg, text=txt)
@@ -485,7 +517,49 @@ class BZModMaster:
             
             widgets['extras'] = extras
             self.path_ui_elements.append(widgets)
-            
+
+        # Detected native Steam Workshop source (read-only, Advanced Mode only).
+        workshop_row_idx = len(paths) + 2
+        workshop_widgets = {'default_text': "Steam Workshop:"}
+        workshop_label = ttk.Label(cfg, text="Steam Workshop:")
+        workshop_label.grid(row=workshop_row_idx, column=0, sticky="w")
+        workshop_widgets['label'] = workshop_label
+
+        workshop_help = tk.Label(
+            cfg,
+            text="?",
+            width=2,
+            bg="#222",
+            fg=self.colors['accent'],
+            font=("Consolas", 8, "bold"),
+            cursor="hand2",
+        )
+        workshop_help.grid(row=workshop_row_idx, column=1, padx=(0, 5))
+        ToolTip(
+            workshop_help,
+            "Detected native Steam Workshop content for this game.\n"
+            "This location is read-only to Mod Engine and is never cleared or deleted.",
+            bg="#1a1a1a",
+            fg=self.colors['accent'],
+        )
+        workshop_widgets['help'] = workshop_help
+
+        self.workshop_entry = ttk.Entry(cfg, textvariable=self.workshop_var, state="readonly")
+        self.workshop_entry.grid(row=workshop_row_idx, column=2, sticky="ew", padx=5)
+        workshop_widgets['entry'] = self.workshop_entry
+        workshop_widgets['browse'] = None
+
+        self.workshop_open_btn = ttk.Button(
+            cfg,
+            text="OPEN",
+            width=8,
+            command=lambda: self.open_generic_folder(self.workshop_var),
+            state="disabled",
+        )
+        self.workshop_open_btn.grid(row=workshop_row_idx, column=4, pady=2, padx=(0, 5))
+        workshop_widgets['extras'] = [self.workshop_open_btn]
+        self.path_ui_elements.append(workshop_widgets)
+
         cfg.columnconfigure(2, weight=1)
 
         # Mod Queue (Preview & Input)
