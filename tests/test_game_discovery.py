@@ -4,6 +4,7 @@ import tempfile
 import unittest
 
 from game_discovery import (
+    build_steam_workshop_content_dir,
     discover_game_install,
     discover_linux_game,
     discover_linux_heroic_game,
@@ -133,6 +134,56 @@ class GameDiscoveryTests(unittest.TestCase):
                 os.path.normpath(os.path.join(library_root, "steamapps", "common", "Battlezone Combat Commander")),
             )
             self.assertEqual(result.source, "steam")
+            self.assertEqual(result.steam_library_root, os.path.normpath(library_root))
+            self.assertEqual(
+                result.workshop_content_dir,
+                build_steam_workshop_content_dir(library_root, "624970"),
+            )
+
+    def test_valid_configured_steam_path_preserves_workshop_metadata(self):
+        game = {
+            "name": "Battlezone 98 Redux",
+            "appid": "301650",
+            "exe": "battlezone98redux.exe",
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            steam_root = os.path.join(temp_dir, "Steam")
+            install_dir = os.path.join(
+                steam_root,
+                "steamapps",
+                "common",
+                "Battlezone 98 Redux",
+            )
+            os.makedirs(install_dir)
+            open(os.path.join(install_dir, "battlezone98redux.exe"), "wb").close()
+            with open(
+                os.path.join(steam_root, "steamapps", "appmanifest_301650.acf"),
+                "w",
+                encoding="utf-8",
+            ) as handle:
+                handle.write(
+                    '"AppState"\n{\n"appid" "301650"\n'
+                    '"installdir" "Battlezone 98 Redux"\n}'
+                )
+
+            fake_registry = FakeWinreg({
+                ("HKCU", r"SOFTWARE\Valve\Steam"): {"SteamPath": steam_root},
+            })
+            result = discover_game_install(
+                game,
+                configured_path=install_dir,
+                is_windows=True,
+                winreg_module=fake_registry,
+                env={},
+            )
+            self.assertIsNotNone(result)
+            self.assertEqual(result.source, "steam")
+            self.assertEqual(result.path, os.path.normpath(install_dir))
+            self.assertEqual(result.steam_library_root, os.path.normpath(steam_root))
+            self.assertEqual(
+                result.workshop_content_dir,
+                build_steam_workshop_content_dir(steam_root, "301650"),
+            )
 
     def test_windows_registry_root_drives_steam_discovery(self):
         game = {
