@@ -11,6 +11,27 @@ class GameInstall:
     workshop_content_dir: str | None = None
 
 
+INSTALL_SOURCE_LABELS = {
+    "configured": "Configured Path",
+    "steam": "Steam",
+    "gog": "GOG",
+    "uninstall": "Windows Install",
+    "heroic": "Heroic",
+}
+
+
+def get_install_source_label(source: str | None) -> str:
+    if not source:
+        return "Configured Path"
+    return INSTALL_SOURCE_LABELS.get(source, str(source).replace("-", " ").title())
+
+
+def format_install_status(source: str | None, detected: bool) -> str:
+    if not detected:
+        return "Not Detected"
+    return f"{get_install_source_label(source)} • Detected ✓"
+
+
 def is_valid_game_path(game: dict, path: str | None) -> bool:
     if not path:
         return False
