@@ -1,3 +1,4 @@
+import json
 import os
 import tempfile
 import unittest
@@ -423,9 +424,14 @@ class GameDiscoveryTests(unittest.TestCase):
                 "w",
                 encoding="utf-8",
             ) as handle:
-                handle.write(
-                    '{"1454067812": {"title": "Battlezone 98 Redux", '
-                    f'"install_path": {install_dir!r}}}'
+                json.dump(
+                    {
+                        "1454067812": {
+                            "title": "Battlezone 98 Redux",
+                            "install_path": install_dir,
+                        }
+                    },
+                    handle,
                 )
 
             paths = get_linux_heroic_paths(
