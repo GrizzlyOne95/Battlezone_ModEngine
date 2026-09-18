@@ -7,6 +7,8 @@ from dataclasses import dataclass
 class GameInstall:
     path: str
     source: str
+    steam_library_root: str | None = None
+    workshop_content_dir: str | None = None
 
 
 def is_valid_game_path(game: dict, path: str | None) -> bool:
@@ -16,6 +18,20 @@ def is_valid_game_path(game: dict, path: str | None) -> bool:
     if not exe_name:
         return False
     return os.path.isfile(os.path.join(os.path.normpath(path), exe_name))
+
+
+def _paths_match(left: str | None, right: str | None) -> bool:
+    if not left or not right:
+        return False
+    return os.path.normcase(os.path.abspath(os.path.normpath(left))) == os.path.normcase(
+        os.path.abspath(os.path.normpath(right))
+    )
+
+
+def build_steam_workshop_content_dir(library_root: str, appid: str) -> str:
+    return os.path.normpath(
+        os.path.join(library_root, "steamapps", "workshop", "content", str(appid))
+    )
 
 
 def _unique_paths(paths) -> list[str]:
@@ -153,7 +169,11 @@ def get_windows_steam_roots(winreg_module, env=None) -> list[str]:
     return _unique_paths(roots)
 
 
-def discover_steam_game(game: dict, steam_roots) -> GameInstall | None:
+def discover_steam_game(
+    game: dict,
+    steam_roots,
+    expected_game_path: str | None = None,
+) -> GameInstall | None:
     appid = str(game.get("appid", "")).strip()
     if not appid:
         return None
@@ -172,8 +192,15 @@ def discover_steam_game(game: dict, steam_roots) -> GameInstall | None:
                 continue
 
             candidate = os.path.normpath(os.path.join(steamapps, "common", install_dir))
+            if expected_game_path and not _paths_match(candidate, expected_game_path):
+                continue
             if is_valid_game_path(game, candidate):
-                return GameInstall(path=candidate, source="steam")
+                return GameInstall(
+                    path=candidate,
+                    source="steam",
+                    steam_library_root=os.path.normpath(library_root),
+                    workshop_content_dir=build_steam_workshop_content_dir(library_root, appid),
+                )
 
     return None
 
@@ -214,8 +241,14 @@ def get_windows_gog_paths(game: dict, winreg_module) -> list[str]:
     return _unique_paths(paths)
 
 
-def discover_windows_gog_game(game: dict, winreg_module) -> GameInstall | None:
+def discover_windows_gog_game(
+    game: dict,
+    winreg_module,
+    expected_game_path: str | None = None,
+) -> GameInstall | None:
     for candidate in get_windows_gog_paths(game, winreg_module):
+        if expected_game_path and not _paths_match(candidate, expected_game_path):
+            continue
         if is_valid_game_path(game, candidate):
             return GameInstall(path=os.path.normpath(candidate), source="gog")
     return None
@@ -355,8 +388,14 @@ def get_windows_uninstall_paths(game: dict, winreg_module) -> list[str]:
     return _unique_paths(paths)
 
 
-def discover_windows_uninstall_game(game: dict, winreg_module) -> GameInstall | None:
+def discover_windows_uninstall_game(
+    game: dict,
+    winreg_module,
+    expected_game_path: str | None = None,
+) -> GameInstall | None:
     for candidate in get_windows_uninstall_paths(game, winreg_module):
+        if expected_game_path and not _paths_match(candidate, expected_game_path):
+            continue
         if is_valid_game_path(game, candidate):
             return GameInstall(path=os.path.normpath(candidate), source="uninstall")
     return None
@@ -519,8 +558,15 @@ def get_linux_heroic_paths(game: dict, env=None, home: str | None = None) -> lis
     return _unique_paths(paths)
 
 
-def discover_linux_heroic_game(game: dict, env=None, home: str | None = None) -> GameInstall | None:
+def discover_linux_heroic_game(
+    game: dict,
+    env=None,
+    home: str | None = None,
+    expected_game_path: str | None = None,
+) -> GameInstall | None:
     for candidate in get_linux_heroic_paths(game, env=env, home=home):
+        if expected_game_path and not _paths_match(candidate, expected_game_path):
+            continue
         if is_valid_game_path(game, candidate):
             return GameInstall(path=os.path.normpath(candidate), source="heroic")
     return None
@@ -548,8 +594,50 @@ def discover_game_install(
     env=None,
     home: str | None = None,
 ) -> GameInstall | None:
-    """Resolve a configured install first, then supported storefront discovery."""
-    if is_valid_game_path(game, configured_path):
+    """Resolve an install while preserving storefront metadata for a valid configured path."""
+    configured_valid = is_valid_game_path(game, configured_path)
+
+    if configured_valid and is_windows:
+        steam_roots = get_windows_steam_roots(winreg_module, env=env)
+        result = discover_steam_game(game, steam_roots, expected_game_path=configured_path)
+        if result:
+            return result
+
+        result = discover_windows_gog_game(
+            game,
+            winreg_module,
+            expected_game_path=configured_path,
+        )
+        if result:
+            return result
+
+        result = discover_windows_uninstall_game(
+            game,
+            winreg_module,
+            expected_game_path=configured_path,
+        )
+        if result:
+            return result
+
+    if configured_valid and is_linux:
+        steam_result = discover_steam_game(
+            game,
+            get_linux_steam_roots(env=env, home=home),
+            expected_game_path=configured_path,
+        )
+        if steam_result:
+            return steam_result
+
+        heroic_result = discover_linux_heroic_game(
+            game,
+            env=env,
+            home=home,
+            expected_game_path=configured_path,
+        )
+        if heroic_result:
+            return heroic_result
+
+    if configured_valid:
         return GameInstall(path=os.path.normpath(configured_path), source="configured")
 
     if is_windows:
