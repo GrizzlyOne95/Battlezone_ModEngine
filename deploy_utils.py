@@ -32,6 +32,45 @@ def build_mod_cache_path(cache_path: str, appid: str, mid: str) -> str:
     return os.path.join(build_content_dir(cache_path, appid), mid)
 
 
+def collect_workshop_mod_sources(
+    primary_content_dir: str,
+    external_content_dirs=None,
+) -> dict[str, dict[str, str]]:
+    """Merge managed cache content with read-only external Workshop sources.
+
+    The Mod Engine cache always wins when the same Workshop item exists in more
+    than one source. External directories are never modified by this helper.
+    """
+    sources: dict[str, dict[str, str]] = {}
+
+    def add_directory(content_dir: str | None, source: str) -> None:
+        if not content_dir or not os.path.isdir(content_dir):
+            return
+        try:
+            entries = sorted(os.listdir(content_dir))
+        except OSError:
+            return
+
+        for entry in entries:
+            item_path = os.path.join(content_dir, entry)
+            if not os.path.isdir(item_path):
+                continue
+            if entry not in sources:
+                sources[entry] = {
+                    "path": os.path.normpath(item_path),
+                    "source": source,
+                }
+
+    add_directory(primary_content_dir, "cache")
+
+    for content_dir in external_content_dirs or []:
+        if paths_match(primary_content_dir, content_dir):
+            continue
+        add_directory(content_dir, "steam")
+
+    return sources
+
+
 def get_cache_marker_path(cache_path: str, marker_filename: str) -> str:
     return os.path.join(cache_path, marker_filename)
 
