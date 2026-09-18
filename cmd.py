@@ -1257,17 +1257,23 @@ class BZModMaster:
 
         if result:
             self.path_var.set(result.path)
+            self.game_install_source = result.source
             self.save_config()
-            if result.source == "steam":
-                self.log(f"Steam installation detected: {result.path}", "success")
+
+            source_labels = {
+                "configured": "Configured path",
+                "steam": "Steam",
+                "gog": "GOG",
+            }
+            source_label = source_labels.get(result.source, result.source.title())
+            if result.source != "configured":
+                self.log(f"{source_label} installation detected: {result.path}", "success")
             if verbose:
-                source = "Steam" if result.source == "steam" else "configured path"
-                messagebox.showinfo("Success", f"Game found via {source}:\n{result.path}")
+                messagebox.showinfo("Success", f"Game found via {source_label}:\n{result.path}")
             return True
 
-        # Preserve the existing GOG/Heroic discovery path as a fallback.
-        self.auto_detect_gog(verbose=False)
-        if self.is_valid_game_install():
+        # Keep the existing Linux heuristics until the Linux/Heroic discovery phase.
+        if IS_LINUX and self.auto_detect_linux_legacy(verbose=False):
             if verbose:
                 messagebox.showinfo("Success", f"Game found at:\n{self.path_var.get()}")
             return True
@@ -1279,27 +1285,13 @@ class BZModMaster:
             )
         return False
 
-    def auto_detect_gog(self, verbose=False):
+    def auto_detect_linux_legacy(self, verbose=False):
         found_path = None
-        
-        if IS_WINDOWS and winreg:
-            # Windows: Check registry
-            gog_ids = self.games[self.current_game_key].get("gog_ids", [])
-            for g_id in gog_ids:
-                for arch in ["SOFTWARE\\WOW6432Node", "SOFTWARE"]:
-                    try:
-                        reg = f"{arch}\\GOG.com\\Games\\{g_id}"
-                        key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, reg, 0, winreg.KEY_READ | winreg.KEY_WOW64_32KEY)
-                        path, _ = winreg.QueryValueEx(key, "path")
-                        found_path = os.path.normpath(path)
-                        break
-                    except: pass
-                if found_path: break
-        elif IS_LINUX:
-            # Linux: Check Heroic, Steam, and common GOG paths
+
+        if IS_LINUX:
             home = Path.home()
             game_exe = self.games[self.current_game_key]["exe"]
-            
+
             candidates = [
                 # Heroic GOG installations
                 home / "Games" / "GOG" / "Battlezone 98 Redux",
@@ -1311,20 +1303,23 @@ class BZModMaster:
                 home / "games" / "battlezone98redux",
                 home / ".wine" / "drive_c" / "GOG Games" / "Battlezone 98 Redux",
             ]
-            
+
             for path in candidates:
                 exe_path = path / game_exe
                 if exe_path.exists():
                     found_path = str(path)
                     break
-        
+
         if found_path and is_valid_game_path(self.games[self.current_game_key], found_path):
             self.path_var.set(found_path)
+            self.game_install_source = "legacy-linux"
             self.save_config()
-            if verbose: messagebox.showinfo("Success", f"Game found at:\n{found_path}")
+            if verbose:
+                messagebox.showinfo("Success", f"Game found at:\n{found_path}")
             return True
+
         if verbose:
-            messagebox.showwarning("Not Found", "Could not automatically locate GOG/Heroic installation.")
+            messagebox.showwarning("Not Found", "Could not automatically locate the Linux installation.")
         return False
 
     def auto_detect_steamcmd(self, verbose=False):
