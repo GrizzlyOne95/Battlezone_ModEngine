@@ -16,7 +16,7 @@ jobs:
   build:
     strategy:
       matrix:
-        os: [windows-latest, ubuntu-latest]
+        os: [windows-latest, ubuntu-latest, macos-latest]
 
     runs-on: ${{ matrix.os }}
 
@@ -94,6 +94,16 @@ jobs:
           chmod +x dist/BZModEngine
           ls -lh dist/BZModEngine
 
+      - name: Verify standalone executable (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f dist/BZModEngine
+          test ! -d dist/BZModEngine
+          chmod +x dist/BZModEngine
+          ls -lh dist/BZModEngine
+
       - name: Package release (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
@@ -109,6 +119,14 @@ jobs:
           set -euo pipefail
           tar -czf "Battlezone_ModEngine-${{ steps.version.outputs.tag }}-linux.tar.gz" -C dist BZModEngine
           ls -lh "Battlezone_ModEngine-${{ steps.version.outputs.tag }}-linux.tar.gz"
+
+      - name: Package release (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          tar -czf "Battlezone_ModEngine-${{ steps.version.outputs.tag }}-macos.tar.gz" -C dist BZModEngine
+          ls -lh "Battlezone_ModEngine-${{ steps.version.outputs.tag }}-macos.tar.gz"
 
       - name: Attest build provenance
         uses: actions/attest-build-provenance@v1
@@ -131,6 +149,14 @@ jobs:
         with:
           name: Battlezone_ModEngine-linux
           path: Battlezone_ModEngine-*-linux.tar.gz
+          if-no-files-found: error
+
+      - name: Upload macOS artifact
+        if: runner.os == 'macOS'
+        uses: actions/upload-artifact@v4
+        with:
+          name: Battlezone_ModEngine-macos
+          path: Battlezone_ModEngine-*-macos.tar.gz
           if-no-files-found: error
 
   release:
@@ -166,5 +192,6 @@ jobs:
           files: |
             artifacts/Battlezone_ModEngine-windows/Battlezone_ModEngine-v*-windows.zip
             artifacts/Battlezone_ModEngine-linux/Battlezone_ModEngine-v*-linux.tar.gz
+            artifacts/Battlezone_ModEngine-macos/Battlezone_ModEngine-v*-macos.tar.gz
           fail_on_unmatched_files: true
           generate_release_notes: true
