@@ -7,6 +7,7 @@ from deploy_utils import (
     build_game_context,
     build_mod_cache_path,
     clear_directory_contents,
+    collect_workshop_mod_sources,
     ensure_cache_root,
     get_cache_marker_path,
     is_safe_cache_root,
@@ -53,6 +54,38 @@ class DeployUtilsTests(unittest.TestCase):
             build_mod_cache_path(cache_root, appid, mid),
             os.path.join("cache", "steamapps", "workshop", "content", "301650", "123"),
         )
+
+    def test_collect_workshop_mod_sources_prefers_managed_cache(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            cache_content = os.path.join(temp_dir, "cache_content")
+            steam_content = os.path.join(temp_dir, "steam_content")
+            os.makedirs(os.path.join(cache_content, "111"))
+            os.makedirs(os.path.join(steam_content, "111"))
+            os.makedirs(os.path.join(steam_content, "222"))
+
+            sources = collect_workshop_mod_sources(
+                cache_content,
+                [steam_content],
+            )
+
+            self.assertEqual(sources["111"]["source"], "cache")
+            self.assertEqual(
+                sources["111"]["path"],
+                os.path.normpath(os.path.join(cache_content, "111")),
+            )
+            self.assertEqual(sources["222"]["source"], "steam")
+            self.assertEqual(
+                sources["222"]["path"],
+                os.path.normpath(os.path.join(steam_content, "222")),
+            )
+
+    def test_collect_workshop_mod_sources_ignores_duplicate_source_dir(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            content_dir = os.path.join(temp_dir, "content")
+            os.makedirs(os.path.join(content_dir, "333"))
+            sources = collect_workshop_mod_sources(content_dir, [content_dir])
+            self.assertEqual(list(sources), ["333"])
+            self.assertEqual(sources["333"]["source"], "cache")
 
     def test_ensure_cache_root_creates_marker_and_marks_safe(self):
         with tempfile.TemporaryDirectory() as temp_dir:

@@ -12,7 +12,6 @@ from io import BytesIO
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 import webbrowser
-from pathlib import Path
 
 from config_utils import get_user_config_dir as util_get_user_config_dir, load_config as util_load_config, save_config as util_save_config
 from deploy_utils import (
@@ -20,6 +19,7 @@ from deploy_utils import (
     build_game_context as util_build_game_context,
     build_mod_cache_path as util_build_mod_cache_path,
     clear_directory_contents as util_clear_directory_contents,
+    collect_workshop_mod_sources as util_collect_workshop_mod_sources,
     create_directory_link as util_create_directory_link,
     deploy_mod as util_deploy_mod,
     ensure_cache_root as util_ensure_cache_root,
@@ -27,6 +27,12 @@ from deploy_utils import (
     is_safe_cache_root as util_is_safe_cache_root,
     normalize_path as util_normalize_path,
     paths_match as util_paths_match,
+)
+from game_discovery import (
+    discover_game_install,
+    format_install_status,
+    get_install_source_label,
+    is_valid_game_path,
 )
 from platform_utils import (
     get_default_steamcmd_path as util_get_default_steamcmd_path,
@@ -181,6 +187,7 @@ class BZModMaster:
                 "name": "Battlezone 98 Redux",
                 "appid": "301650",
                 "gog_ids": ["1454067812", "1459427445"],
+                "aliases": ["Battlezone98Redux", "BZ98R"],
                 "exe": "battlezone98redux.exe",
                 "font_file": "BZONE.ttf",
                 "font_name": "BZONE",
@@ -194,6 +201,7 @@ class BZModMaster:
                 "name": "Battlezone Combat Commander",
                 "appid": "624970",
                 "gog_ids": ["1193046833"],
+                "aliases": ["BZCC", "BattlezoneCombatCommander"],
                 "exe": "battlezone2.exe",
                 "font_file": "BGM.ttf",
                 "font_name": "BankGothic",
@@ -231,10 +239,15 @@ class BZModMaster:
         self.path_var = tk.StringVar(value=saved_path)
         self.steamcmd_var = tk.StringVar(value=self.config.get("steamcmd_path", ""))
         self.cache_var = tk.StringVar(value=self.config.get("cache_path", os.path.join(self.base_dir, "workshop_cache")))
-        
+        self.workshop_var = tk.StringVar(value="")
+
         self.mod_id_var = tk.StringVar()
         self.image_cache = {}
         self.is_valid_mod = False
+        self.game_install_sources = {}
+        self.game_workshop_dirs = {}
+        self.mod_source_paths = {}
+        self.mod_source_kinds = {}
         
         # Threading & Process Control
         self.stop_event = threading.Event()
@@ -250,7 +263,9 @@ class BZModMaster:
         self.setup_ui()
         self.check_admin()
         
-        if not self.path_var.get(): self.auto_detect_gog()
+        # Always resolve metadata for the active install so a saved Steam path
+        # still retains its Steam library / Workshop relationship.
+        self.auto_detect_game()
         if not self.steamcmd_var.get(): self.auto_detect_steamcmd()
         self.toggle_ui_mode()
         threading.Thread(target=self.initialize_engine, daemon=True).start()
@@ -312,7 +327,13 @@ class BZModMaster:
     def build_game_context(self, game_key=None, game_path=None):
         resolved_key = game_key or self.current_game_key
         raw_game_path = game_path if game_path is not None else self.path_var.get()
-        return util_build_game_context(self.games, resolved_key, raw_game_path)
+        context = util_build_game_context(self.games, resolved_key, raw_game_path)
+        context["install_source"] = self.game_install_sources.get(resolved_key, "")
+        context["workshop_content_dir"] = self.game_workshop_dirs.get(resolved_key, "")
+        return context
+
+    def collect_workshop_mod_sources(self, primary_content_dir, external_content_dirs=None):
+        return util_collect_workshop_mod_sources(primary_content_dir, external_content_dirs)
 
     def build_content_dir(self, cache_path, appid):
         return util_build_content_dir(cache_path, appid)
@@ -421,6 +442,32 @@ class BZModMaster:
         self.icon_label.pack(side="left", padx=5)
         self.update_game_icon()
 
+        # Concise install status. This is the primary configuration surface in Simple Mode.
+        status_row = ttk.Frame(cfg)
+        status_row.grid(row=1, column=0, columnspan=6, sticky="ew", pady=(0, 8))
+        ttk.Label(status_row, text="INSTALL STATUS:", font=(self.current_font, 10, "bold")).pack(side="left")
+        self.install_status_label = ttk.Label(
+            status_row,
+            text="Not Detected",
+            foreground="#ff4444",
+            font=("Consolas", 10, "bold"),
+        )
+        self.install_status_label.pack(side="left", padx=(8, 12))
+        self.simple_detect_btn = ttk.Button(
+            status_row,
+            text="DETECT",
+            width=10,
+            command=lambda: self.auto_detect_game(verbose=True),
+        )
+        self.simple_detect_btn.pack(side="left", padx=(0, 5))
+        self.simple_browse_btn = ttk.Button(
+            status_row,
+            text="BROWSE",
+            width=10,
+            command=self.browse_game,
+        )
+        self.simple_browse_btn.pack(side="left")
+
         # Path Rows
         paths = [
             ("Game Path:", self.path_var, self.browse_game, "path_entry", 
@@ -433,7 +480,7 @@ class BZModMaster:
 
         self.path_ui_elements = []
         for i, (txt, var, cmd, attr, tip) in enumerate(paths):
-            row_idx = i + 1
+            row_idx = i + 2
             widgets = {'default_text': txt}
             
             l = ttk.Label(cfg, text=txt)
@@ -459,7 +506,7 @@ class BZModMaster:
                 extras.append(ttk.Button(cfg, text="OPEN", width=8, command=lambda v=var: self.open_generic_folder(v)))
                 extras.append(ttk.Button(cfg, text="CLEAR", width=8, command=self.clear_cache))
             elif "Game" in txt:
-                extras.append(ttk.Button(cfg, text="DETECT", width=8, command=lambda: self.auto_detect_gog(verbose=True)))
+                extras.append(ttk.Button(cfg, text="DETECT", width=8, command=lambda: self.auto_detect_game(verbose=True)))
                 extras.append(ttk.Button(cfg, text="OPEN", width=8, command=lambda v=var: self.open_generic_folder(v)))
             elif "Steam" in txt:
                 extras.append(ttk.Button(cfg, text="DETECT", width=8, command=lambda: self.auto_detect_steamcmd(verbose=True)))
@@ -470,7 +517,49 @@ class BZModMaster:
             
             widgets['extras'] = extras
             self.path_ui_elements.append(widgets)
-            
+
+        # Detected native Steam Workshop source (read-only, Advanced Mode only).
+        workshop_row_idx = len(paths) + 2
+        workshop_widgets = {'default_text': "Steam Workshop:"}
+        workshop_label = ttk.Label(cfg, text="Steam Workshop:")
+        workshop_label.grid(row=workshop_row_idx, column=0, sticky="w")
+        workshop_widgets['label'] = workshop_label
+
+        workshop_help = tk.Label(
+            cfg,
+            text="?",
+            width=2,
+            bg="#222",
+            fg=self.colors['accent'],
+            font=("Consolas", 8, "bold"),
+            cursor="hand2",
+        )
+        workshop_help.grid(row=workshop_row_idx, column=1, padx=(0, 5))
+        ToolTip(
+            workshop_help,
+            "Detected native Steam Workshop content for this game.\n"
+            "This location is read-only to Mod Engine and is never cleared or deleted.",
+            bg="#1a1a1a",
+            fg=self.colors['accent'],
+        )
+        workshop_widgets['help'] = workshop_help
+
+        self.workshop_entry = ttk.Entry(cfg, textvariable=self.workshop_var, state="readonly")
+        self.workshop_entry.grid(row=workshop_row_idx, column=2, sticky="ew", padx=5)
+        workshop_widgets['entry'] = self.workshop_entry
+        workshop_widgets['browse'] = None
+
+        self.workshop_open_btn = ttk.Button(
+            cfg,
+            text="OPEN",
+            width=8,
+            command=lambda: self.open_generic_folder(self.workshop_var),
+            state="disabled",
+        )
+        self.workshop_open_btn.grid(row=workshop_row_idx, column=4, pady=2, padx=(0, 5))
+        workshop_widgets['extras'] = [self.workshop_open_btn]
+        self.path_ui_elements.append(workshop_widgets)
+
         cfg.columnconfigure(2, weight=1)
 
         # Mod Queue (Preview & Input)
@@ -589,31 +678,32 @@ class BZModMaster:
 
     def toggle_ui_mode(self):
         advanced = self.advanced_mode_var.get()
-        
-        # 0: Game Path, 1: SteamCMD, 2: Cache
-        self.set_row_visibility(0, show_row=advanced, simple=not advanced)
-        self.set_row_visibility(1, show_row=advanced, simple=not advanced)
-        self.set_row_visibility(2, show_row=True, simple=not advanced)
-        
-        # Update Cache Label
-        cache_widgets = self.path_ui_elements[2]
-        cache_widgets['label'].config(text="Download Folder:" if not advanced else cache_widgets['default_text'])
 
-        # Update Simple Mode Texts
+        # Simple Mode presents status, not raw filesystem plumbing.
+        self.set_row_visibility(0, show_row=advanced, simple=False)  # Game Path
+        self.set_row_visibility(1, show_row=advanced, simple=False)  # SteamCMD
+        self.set_row_visibility(2, show_row=advanced, simple=False)  # Mod Engine Cache
+        self.set_row_visibility(3, show_row=advanced, simple=False)  # Native Steam Workshop
+
+        cache_widgets = self.path_ui_elements[2]
+        cache_widgets['label'].config(text=cache_widgets['default_text'])
+
         if not advanced:
+            self.simple_detect_btn.pack(side="left", padx=(0, 5))
+            self.simple_browse_btn.pack(side="left")
             self.thumb_label.config(text="DRAG MOD LINK HERE\nOR COPY/PASTE")
             self.mod_url_label.config(text="PASTE WORKSHOP LINK HERE:")
         else:
+            self.simple_detect_btn.pack_forget()
+            self.simple_browse_btn.pack_forget()
             self.thumb_label.config(text="ADD MOD\nLINK OR ID")
             self.mod_url_label.config(text="MOD URL OR ID:")
 
-        # Buttons
         if not advanced:
             self.workshop_btn.pack_forget()
             self.launch_btn.pack_forget()
             self.stop_btn.pack_forget()
         else:
-            # Repack to ensure order
             for btn in [self.dl_btn, self.launch_btn, self.workshop_btn, self.stop_btn]:
                 btn.pack_forget()
             self.dl_btn.pack(side="left", padx=(0, 5))
@@ -621,25 +711,33 @@ class BZModMaster:
             self.workshop_btn.pack(side="left", padx=5)
             self.stop_btn.pack(side="left", padx=5)
 
+        self.update_install_ui()
+
     def set_row_visibility(self, index, show_row, simple):
         widgets = self.path_ui_elements[index]
+        browse = widgets.get('browse')
         if show_row:
             widgets['label'].grid()
             widgets['entry'].grid()
-            widgets['browse'].grid()
-            
+            if browse is not None:
+                browse.grid()
+
             if simple:
                 widgets['help'].grid_remove()
-                for w in widgets['extras']: w.grid_remove()
+                for w in widgets['extras']:
+                    w.grid_remove()
             else:
                 widgets['help'].grid()
-                for w in widgets['extras']: w.grid()
+                for w in widgets['extras']:
+                    w.grid()
         else:
             widgets['label'].grid_remove()
             widgets['entry'].grid_remove()
-            widgets['browse'].grid_remove()
+            if browse is not None:
+                browse.grid_remove()
             widgets['help'].grid_remove()
-            for w in widgets['extras']: w.grid_remove()
+            for w in widgets['extras']:
+                w.grid_remove()
 
     def update_styles(self, style):
         main_font = (self.current_font, 10)
@@ -732,6 +830,7 @@ class BZModMaster:
         self.update_game_icon()
         
         self.log(f"Switched to {self.games[new_key]['name']}", "info")
+        self.auto_detect_game()
         self.initialize_engine()
         self.refresh_list()
         self.save_config()
@@ -1138,7 +1237,13 @@ class BZModMaster:
 
             self.path_var.set(new_path)
             self.path_entry.configure(foreground=self.colors['accent']) # Reset color
-            self.save_config()
+            if self.is_valid_game_install(new_path):
+                self.auto_detect_game()
+            else:
+                self.game_install_sources[self.current_game_key] = "configured"
+                self.game_workshop_dirs[self.current_game_key] = ""
+                self.save_config()
+                self.update_install_ui()
             self.log(f"Game path updated: {p}", "success")
 
     def browse_steamcmd(self): 
@@ -1221,7 +1326,10 @@ class BZModMaster:
         if messagebox.askyesno("Clear Cache", f"Are you sure you want to delete all files in:\n{cache_path}\n\nThis will force re-download of all mods."):
             try:
                 self.clear_directory_contents(cache_root, preserve_names={CACHE_MARKER_FILE})
-                self.log("Cache cleared successfully.", "success")
+                self.log(
+                    "Mod Engine cache cleared successfully. Steam-managed Workshop content was left untouched.",
+                    "success",
+                )
                 self.refresh_list()
             except Exception as e:
                 self.log(f"Failed to clear cache: {e}", "error")
@@ -1237,51 +1345,71 @@ class BZModMaster:
         else:
             self.launch_btn.config(text="EXE MISSING")
             self.root.after(2000, lambda: self.launch_btn.config(text="LAUNCH GAME"))
-    def auto_detect_gog(self, verbose=False):
-        found_path = None
-        
-        if IS_WINDOWS and winreg:
-            # Windows: Check registry
-            gog_ids = self.games[self.current_game_key].get("gog_ids", [])
-            for g_id in gog_ids:
-                for arch in ["SOFTWARE\\WOW6432Node", "SOFTWARE"]:
-                    try:
-                        reg = f"{arch}\\GOG.com\\Games\\{g_id}"
-                        key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, reg, 0, winreg.KEY_READ | winreg.KEY_WOW64_32KEY)
-                        path, _ = winreg.QueryValueEx(key, "path")
-                        found_path = os.path.normpath(path)
-                        break
-                    except: pass
-                if found_path: break
-        elif IS_LINUX:
-            # Linux: Check Heroic, Steam, and common GOG paths
-            home = Path.home()
-            game_exe = self.games[self.current_game_key]["exe"]
-            
-            candidates = [
-                # Heroic GOG installations
-                home / "Games" / "GOG" / "Battlezone 98 Redux",
-                home / "Games" / "Heroic" / "Battlezone 98 Redux",
-                # Steam installations
-                home / ".local" / "share" / "Steam" / "steamapps" / "common" / "Battlezone 98 Redux",
-                home / ".steam" / "steam" / "steamapps" / "common" / "Battlezone 98 Redux",
-                # Manual installations
-                home / "games" / "battlezone98redux",
-                home / ".wine" / "drive_c" / "GOG Games" / "Battlezone 98 Redux",
-            ]
-            
-            for path in candidates:
-                exe_path = path / game_exe
-                if exe_path.exists():
-                    found_path = str(path)
-                    break
-        
-        if found_path:
-            self.path_var.set(found_path)
+    def is_valid_game_install(self, path=None, game_key=None):
+        resolved_key = game_key or self.current_game_key
+        candidate = self.path_var.get() if path is None else path
+        return is_valid_game_path(self.games[resolved_key], candidate)
+
+    def update_install_ui(self):
+        if not hasattr(self, "install_status_label"):
+            return
+
+        game_key = self.current_game_key
+        detected = self.is_valid_game_install(game_key=game_key)
+        source = self.game_install_sources.get(game_key, "")
+        status_text = format_install_status(source, detected)
+        status_color = self.colors['highlight'] if detected else "#ff4444"
+        self.install_status_label.configure(text=status_text, foreground=status_color)
+
+        workshop_path = self.game_workshop_dirs.get(game_key, "")
+        if workshop_path:
+            self.workshop_var.set(workshop_path)
+            workshop_state = "normal" if os.path.isdir(workshop_path) else "disabled"
+        else:
+            self.workshop_var.set("Not available for this install")
+            workshop_state = "disabled"
+
+        if hasattr(self, "workshop_open_btn"):
+            self.workshop_open_btn.configure(state=workshop_state)
+
+    def auto_detect_game(self, verbose=False):
+        game_key = self.current_game_key
+        game = self.games[game_key]
+        previous_path = self.path_var.get()
+        result = discover_game_install(
+            game,
+            configured_path=previous_path,
+            is_windows=IS_WINDOWS,
+            is_linux=IS_LINUX,
+            winreg_module=winreg,
+        )
+
+        if result:
+            self.path_var.set(result.path)
+            self.game_install_sources[game_key] = result.source
+            self.game_workshop_dirs[game_key] = result.workshop_content_dir or ""
             self.save_config()
-            if verbose: messagebox.showinfo("Success", f"Game found at:\n{found_path}")
-        elif verbose:
-            messagebox.showwarning("Not Found", "Could not automatically locate GOG/Heroic installation.")
+            self.update_install_ui()
+
+            source_label = get_install_source_label(result.source)
+            path_changed = not self.paths_match(previous_path, result.path)
+            if result.source != "configured" and (path_changed or verbose):
+                self.log(f"{source_label} installation detected: {result.path}", "success")
+            if result.workshop_content_dir and (path_changed or verbose):
+                self.log(f"Steam Workshop source: {result.workshop_content_dir}", "info")
+            if verbose:
+                messagebox.showinfo("Success", f"Game found via {source_label}:\n{result.path}")
+            return True
+
+        self.game_install_sources[game_key] = ""
+        self.game_workshop_dirs[game_key] = ""
+        self.update_install_ui()
+        if verbose:
+            messagebox.showwarning(
+                "Not Found",
+                "Could not automatically locate this game. Please browse to the installation folder.",
+            )
+        return False
 
     def auto_detect_steamcmd(self, verbose=False):
         for p in self.get_steamcmd_candidates():
@@ -1337,15 +1465,14 @@ class BZModMaster:
         self.tree.selection_set(self.tree.get_children())
 
     def refresh_list(self):
-        """Scans SteamCMD cache and determines if mods are 'enabled' in the test folder."""
+        """Scan the managed SteamCMD cache plus any detected Steam Workshop source."""
         self.progress_label.config(text="SCANNING...", fg=self.colors['accent'])
         self.image_cache.clear()
         self.progress.config(mode="indeterminate"); self.progress.start(10)
-        
-        # Offload file system scanning to a background thread
+
         cache_path = self.cache_var.get()
         game_context = self.build_game_context()
-        
+
         self.start_task()
         threading.Thread(target=self._refresh_scan_logic, args=(cache_path, game_context), daemon=True).start()
 
@@ -1358,50 +1485,66 @@ class BZModMaster:
                 self.log("SCAN FAILED: Game path is not configured.", "error")
                 self.root.after(0, lambda: self._populate_tree([], game_context))
                 return
-            
-            # Correct nested SteamCMD structure
+
             current_appid = game_context["appid"]
-            content_dir = self.build_content_dir(base_cache, current_appid)
+            cache_content_dir = self.build_content_dir(base_cache, current_appid)
+            external_dirs = []
+            steam_workshop_dir = game_context.get("workshop_content_dir")
+            if steam_workshop_dir:
+                external_dirs.append(steam_workshop_dir)
+
+            mod_sources = self.collect_workshop_mod_sources(cache_content_dir, external_dirs)
             game_mods_dir = os.path.join(game_dir, "mods")
-            
+
             self.log("--- SCANNING FOR ASSETS ---", "info")
 
-            # Ensure the test 'mods' folder exists
             if not os.path.exists(game_mods_dir):
-                try: os.makedirs(game_mods_dir)
-                except: pass
+                try:
+                    os.makedirs(game_mods_dir)
+                except Exception:
+                    pass
 
-            if not os.path.exists(content_dir):
-                self.log(f"SCAN FAILED: No cache at {content_dir}", "error")
+            if not mod_sources:
+                locations = [cache_content_dir, *external_dirs]
+                self.log(
+                    "No Workshop content found in: " + " | ".join(locations),
+                    "warning",
+                )
                 self.root.after(0, lambda: self._populate_tree([], game_context))
                 return
 
-            try:
-                mod_ids = [d for d in os.listdir(content_dir) if os.path.isdir(os.path.join(content_dir, d))]
-                self.log(f"Found {len(mod_ids)} assets in Steam cache.", "success")
-            except:
-                self.root.after(0, lambda: self._populate_tree([], game_context))
-                return
+            cache_count = sum(1 for value in mod_sources.values() if value["source"] == "cache")
+            steam_count = sum(1 for value in mod_sources.values() if value["source"] == "steam")
+            if steam_count:
+                self.log(
+                    f"Found {cache_count} Mod Engine cached and {steam_count} Steam-managed Workshop item(s).",
+                    "success",
+                )
+            else:
+                self.log(f"Found {cache_count} item(s) in the Mod Engine cache.", "success")
 
-            # Collect data to pass back to UI thread
             scan_data = []
-            for mid in mod_ids:
-                if self.stop_event.is_set(): return
-                mod_path = os.path.join(content_dir, mid)
+            for mid, source_info in mod_sources.items():
+                if self.stop_event.is_set():
+                    return
+
+                mod_path = source_info["path"]
+                source_kind = source_info["source"]
                 link_path = os.path.join(game_mods_dir, mid)
-                
-                # Use lexists to see if the link is present in your test folder
+
                 is_enabled = os.path.lexists(link_path)
                 status = "ENABLED" if is_enabled else "DISABLED"
-                
+
                 try:
                     m_time = os.path.getmtime(mod_path)
                     dt = datetime.fromtimestamp(m_time).strftime('%Y-%m-%d')
-                except:
+                except Exception:
                     m_time = 0
                     dt = "Unknown"
-                
-                scan_data.append((mid, status, is_enabled, m_time, dt))
+
+                scan_data.append(
+                    (mid, status, is_enabled, m_time, dt, mod_path, source_kind)
+                )
 
             self.root.after(0, lambda: self._populate_tree(scan_data, game_context))
         finally:
@@ -1412,12 +1555,16 @@ class BZModMaster:
             return
 
         self.tree.delete(*self.tree.get_children())
-        
-        for mid, status, is_enabled, m_time, dt in scan_data:
+        self.mod_source_paths = {}
+        self.mod_source_kinds = {}
+
+        for mid, status, is_enabled, m_time, dt, mod_path, source_kind in scan_data:
+            self.mod_source_paths[mid] = mod_path
+            self.mod_source_kinds[mid] = source_kind
             display_status = f"{status} (Checking...)"
-            
+
             item = self.tree.insert("", "end", values=("Fetching...", mid, display_status, "Checking...", dt))
-            
+
             if is_enabled:
                 self.tree.item(item, tags=('active',))
             else:
@@ -1504,12 +1651,13 @@ class BZModMaster:
             self.root.after(0, lambda: self.safe_tree_set_for_game(game_context["key"], item, "Status", base_status))
 
     def enable_mod(self):
-        """Creates a Junction link from the deep cache to the game folder for all selected mods."""
+        """Enable selected mods from either the managed cache or detected Steam Workshop."""
         selected = self.tree.selection()
-        if not selected: return
-        
-        # Extract data on main thread
+        if not selected:
+            return
+
         mods_to_enable = [str(self.tree.item(item)['values'][1]) for item in selected]
+        source_paths = {mid: self.mod_source_paths.get(mid) for mid in mods_to_enable}
         cache_path = self.cache_var.get()
         game_context = self.build_game_context()
         game_path = game_context["game_path"]
@@ -1520,19 +1668,23 @@ class BZModMaster:
         self.start_task()
         threading.Thread(
             target=self._enable_mod_worker,
-            args=(mods_to_enable, cache_path, game_context, use_physical),
+            args=(mods_to_enable, source_paths, cache_path, game_context, use_physical),
             daemon=True
         ).start()
 
-    def _enable_mod_worker(self, mods, cache_path, game_context, use_physical):
+    def _enable_mod_worker(self, mods, source_paths, cache_path, game_context, use_physical):
         try:
             cache_root = self.ensure_cache_root(cache_path)
             for mid in mods:
-                if self.stop_event.is_set(): break
+                if self.stop_event.is_set():
+                    break
+
                 current_appid = game_context["appid"]
-                src = self.build_mod_cache_path(cache_root, current_appid, mid)
+                src = source_paths.get(mid)
+                if not src or not os.path.exists(src):
+                    src = self.build_mod_cache_path(cache_root, current_appid, mid)
                 dst = os.path.join(game_context["game_path"], "mods", mid)
-                
+
                 try:
                     deployed = self.deploy_mod(mid, src, dst, use_physical)
                     if deployed:
@@ -1705,19 +1857,32 @@ class BZModMaster:
         ).start()
 
     def delete_mod_physically(self):
-        """Wipes the selected mods from the SteamCMD cache and breaks any links."""
+        """Delete managed cache copies and break links without touching Steam-owned files."""
         selected = self.tree.selection()
-        if not selected: return
+        if not selected:
+            return
 
-        count = len(selected)
+        mods_to_delete = [str(self.tree.item(item)['values'][1]) for item in selected]
+        steam_managed = [
+            mid for mid in mods_to_delete
+            if self.mod_source_kinds.get(mid) == "steam"
+        ]
+        count = len(mods_to_delete)
+
         if count == 1:
-            mid = str(self.tree.item(selected[0])['values'][1])
-            prompt_message = f"Permanently delete Mod ID {mid} from disk?"
+            prompt_message = f"Remove Mod ID {mods_to_delete[0]} from the Mod Engine?"
         else:
-            prompt_message = f"Permanently delete {count} selected mods from disk?"
+            prompt_message = f"Remove {count} selected mods from the Mod Engine?"
+
+        if steam_managed:
+            prompt_message += (
+                "\n\nSteam-managed Workshop files will NOT be deleted. "
+                "Only links and any Mod Engine cached copies are removed."
+            )
+        else:
+            prompt_message += "\n\nThis deletes the Mod Engine cached copy from disk."
 
         if messagebox.askyesno("TERMINATE ASSET(S)", prompt_message):
-            mods_to_delete = [str(self.tree.item(item)['values'][1]) for item in selected]
             cache_path = self.cache_var.get()
             game_context = self.build_game_context()
             self.start_task()
@@ -1749,7 +1914,12 @@ class BZModMaster:
                 try:
                     if os.path.exists(mod_cache_path):
                         self.remove_existing_path(mod_cache_path)
-                        self.log(f"Asset {mid} purged from local storage.", "warning")
+                        self.log(f"Asset {mid} purged from the Mod Engine cache.", "warning")
+                    elif self.mod_source_kinds.get(mid) == "steam":
+                        self.log(
+                            f"Asset {mid} is Steam-managed; external Workshop content was left untouched.",
+                            "warning",
+                        )
                 except Exception as e:
                     self.log(f"Purge Error for {mid}: {e}", "error")
                 
