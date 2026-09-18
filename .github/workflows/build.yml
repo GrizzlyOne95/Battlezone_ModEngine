@@ -68,16 +68,38 @@ jobs:
         run: |
           python scripts/generate_version_info.py --version "${{ steps.version.outputs.version }}" --output branding/version_info.txt
 
-      - name: Build executable bundle
+      - name: Build standalone executable
         run: |
           pyinstaller build.spec
+
+      - name: Verify standalone executable (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          if (-not (Test-Path ".\dist\BZModEngine.exe" -PathType Leaf)) {
+            throw "Expected standalone dist\BZModEngine.exe was not produced"
+          }
+          if (Test-Path ".\dist\BZModEngine" -PathType Container) {
+            throw "Unexpected onedir bundle dist\BZModEngine was produced"
+          }
+          Get-Item ".\dist\BZModEngine.exe"
+
+      - name: Verify standalone executable (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f dist/BZModEngine
+          test ! -d dist/BZModEngine
+          chmod +x dist/BZModEngine
+          ls -lh dist/BZModEngine
 
       - name: Package release (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
           $archive = "Battlezone_ModEngine-${{ steps.version.outputs.tag }}-windows.zip"
-          Compress-Archive -Path dist/BZModEngine -DestinationPath $archive -Force
+          Compress-Archive -Path dist/BZModEngine.exe -DestinationPath $archive -Force
           Get-Item $archive
 
       - name: Package release (Linux)
