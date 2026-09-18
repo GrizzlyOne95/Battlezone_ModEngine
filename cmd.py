@@ -1350,7 +1350,29 @@ class BZModMaster:
         candidate = self.path_var.get() if path is None else path
         return is_valid_game_path(self.games[resolved_key], candidate)
 
-      def auto_detect_game(self, verbose=False):
+    def update_install_ui(self):
+        if not hasattr(self, "install_status_label"):
+            return
+
+        game_key = self.current_game_key
+        detected = self.is_valid_game_install(game_key=game_key)
+        source = self.game_install_sources.get(game_key, "")
+        status_text = format_install_status(source, detected)
+        status_color = self.colors['highlight'] if detected else "#ff4444"
+        self.install_status_label.configure(text=status_text, foreground=status_color)
+
+        workshop_path = self.game_workshop_dirs.get(game_key, "")
+        if workshop_path:
+            self.workshop_var.set(workshop_path)
+            workshop_state = "normal" if os.path.isdir(workshop_path) else "disabled"
+        else:
+            self.workshop_var.set("Not available for this install")
+            workshop_state = "disabled"
+
+        if hasattr(self, "workshop_open_btn"):
+            self.workshop_open_btn.configure(state=workshop_state)
+
+    def auto_detect_game(self, verbose=False):
         game_key = self.current_game_key
         game = self.games[game_key]
         previous_path = self.path_var.get()
