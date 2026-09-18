@@ -28,6 +28,7 @@ from deploy_utils import (
     normalize_path as util_normalize_path,
     paths_match as util_paths_match,
 )
+from game_discovery import discover_game_install, is_valid_game_path
 from platform_utils import (
     get_default_steamcmd_path as util_get_default_steamcmd_path,
     get_popen_output_kwargs as util_get_popen_output_kwargs,
@@ -250,7 +251,8 @@ class BZModMaster:
         self.setup_ui()
         self.check_admin()
         
-        if not self.path_var.get(): self.auto_detect_gog()
+        if not self.is_valid_game_install():
+            self.auto_detect_game()
         if not self.steamcmd_var.get(): self.auto_detect_steamcmd()
         self.toggle_ui_mode()
         threading.Thread(target=self.initialize_engine, daemon=True).start()
@@ -459,7 +461,7 @@ class BZModMaster:
                 extras.append(ttk.Button(cfg, text="OPEN", width=8, command=lambda v=var: self.open_generic_folder(v)))
                 extras.append(ttk.Button(cfg, text="CLEAR", width=8, command=self.clear_cache))
             elif "Game" in txt:
-                extras.append(ttk.Button(cfg, text="DETECT", width=8, command=lambda: self.auto_detect_gog(verbose=True)))
+                extras.append(ttk.Button(cfg, text="DETECT", width=8, command=lambda: self.auto_detect_game(verbose=True)))
                 extras.append(ttk.Button(cfg, text="OPEN", width=8, command=lambda v=var: self.open_generic_folder(v)))
             elif "Steam" in txt:
                 extras.append(ttk.Button(cfg, text="DETECT", width=8, command=lambda: self.auto_detect_steamcmd(verbose=True)))
@@ -732,6 +734,8 @@ class BZModMaster:
         self.update_game_icon()
         
         self.log(f"Switched to {self.games[new_key]['name']}", "info")
+        if not self.is_valid_game_install():
+            self.auto_detect_game()
         self.initialize_engine()
         self.refresh_list()
         self.save_config()
@@ -1237,6 +1241,44 @@ class BZModMaster:
         else:
             self.launch_btn.config(text="EXE MISSING")
             self.root.after(2000, lambda: self.launch_btn.config(text="LAUNCH GAME"))
+    def is_valid_game_install(self, path=None, game_key=None):
+        resolved_key = game_key or self.current_game_key
+        candidate = self.path_var.get() if path is None else path
+        return is_valid_game_path(self.games[resolved_key], candidate)
+
+    def auto_detect_game(self, verbose=False):
+        game = self.games[self.current_game_key]
+        result = discover_game_install(
+            game,
+            configured_path=self.path_var.get(),
+            is_windows=IS_WINDOWS,
+            winreg_module=winreg,
+        )
+
+        if result:
+            self.path_var.set(result.path)
+            self.save_config()
+            if result.source == "steam":
+                self.log(f"Steam installation detected: {result.path}", "success")
+            if verbose:
+                source = "Steam" if result.source == "steam" else "configured path"
+                messagebox.showinfo("Success", f"Game found via {source}:\n{result.path}")
+            return True
+
+        # Preserve the existing GOG/Heroic discovery path as a fallback.
+        self.auto_detect_gog(verbose=False)
+        if self.is_valid_game_install():
+            if verbose:
+                messagebox.showinfo("Success", f"Game found at:\n{self.path_var.get()}")
+            return True
+
+        if verbose:
+            messagebox.showwarning(
+                "Not Found",
+                "Could not automatically locate this game. Please browse to the installation folder.",
+            )
+        return False
+
     def auto_detect_gog(self, verbose=False):
         found_path = None
         
@@ -1276,12 +1318,14 @@ class BZModMaster:
                     found_path = str(path)
                     break
         
-        if found_path:
+        if found_path and is_valid_game_path(self.games[self.current_game_key], found_path):
             self.path_var.set(found_path)
             self.save_config()
             if verbose: messagebox.showinfo("Success", f"Game found at:\n{found_path}")
-        elif verbose:
+            return True
+        if verbose:
             messagebox.showwarning("Not Found", "Could not automatically locate GOG/Heroic installation.")
+        return False
 
     def auto_detect_steamcmd(self, verbose=False):
         for p in self.get_steamcmd_candidates():
