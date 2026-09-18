@@ -169,6 +169,50 @@ def get_windows_steam_roots(winreg_module, env=None) -> list[str]:
     return _unique_paths(roots)
 
 
+def infer_steam_install_from_game_path(
+    game: dict,
+    game_path: str | None,
+) -> GameInstall | None:
+    """Recover the Steam library directly from a configured .../steamapps/common path."""
+    if not is_valid_game_path(game, game_path):
+        return None
+
+    candidate = os.path.normpath(game_path)
+    common_dir = os.path.dirname(candidate)
+    steamapps_dir = os.path.dirname(common_dir)
+
+    if os.path.basename(common_dir).lower() != "common":
+        return None
+    if os.path.basename(steamapps_dir).lower() != "steamapps":
+        return None
+
+    appid = str(game.get("appid", "")).strip()
+    if not appid:
+        return None
+
+    manifest_path = os.path.join(steamapps_dir, f"appmanifest_{appid}.acf")
+    try:
+        with open(manifest_path, "r", encoding="utf-8", errors="replace") as handle:
+            install_dir = parse_appmanifest_install_dir(handle.read())
+    except OSError:
+        return None
+
+    if not install_dir:
+        return None
+
+    manifest_game_path = os.path.join(steamapps_dir, "common", install_dir)
+    if not _paths_match(manifest_game_path, candidate):
+        return None
+
+    library_root = os.path.dirname(steamapps_dir)
+    return GameInstall(
+        path=candidate,
+        source="steam",
+        steam_library_root=os.path.normpath(library_root),
+        workshop_content_dir=build_steam_workshop_content_dir(library_root, appid),
+    )
+
+
 def discover_steam_game(
     game: dict,
     steam_roots,
@@ -596,6 +640,11 @@ def discover_game_install(
 ) -> GameInstall | None:
     """Resolve an install while preserving storefront metadata for a valid configured path."""
     configured_valid = is_valid_game_path(game, configured_path)
+
+    if configured_valid:
+        inferred_steam = infer_steam_install_from_game_path(game, configured_path)
+        if inferred_steam:
+            return inferred_steam
 
     if configured_valid and is_windows:
         steam_roots = get_windows_steam_roots(winreg_module, env=env)
