@@ -49,10 +49,24 @@ jobs:
         run: |
           python scripts/generate_app_icon.py branding/repo_icon.svg branding/app_icon.ico --png branding/app_icon.png
 
+      - name: Resolve package version
+        id: version
+        shell: bash
+        run: |
+          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
+            version="${GITHUB_REF_NAME#v}"
+            tag="$GITHUB_REF_NAME"
+          else
+            version="$(tr -d '[:space:]' < VERSION)"
+            tag="v$version"
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
       - name: Generate Windows version metadata
         if: runner.os == 'Windows'
         run: |
-          python scripts/generate_version_info.py --version "${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || '0.0.0' }}" --output branding/version_info.txt
+          python scripts/generate_version_info.py --version "${{ steps.version.outputs.version }}" --output branding/version_info.txt
 
       - name: Build executable bundle
         run: |
@@ -62,7 +76,7 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $archive = "Battlezone_ModEngine-${env:GITHUB_REF_NAME}-windows.zip"
+          $archive = "Battlezone_ModEngine-${{ steps.version.outputs.tag }}-windows.zip"
           Compress-Archive -Path dist/BZModEngine -DestinationPath $archive -Force
           Get-Item $archive
 
@@ -71,8 +85,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          tar -czf "Battlezone_ModEngine-${GITHUB_REF_NAME}-linux.tar.gz" -C dist BZModEngine
-          ls -lh "Battlezone_ModEngine-${GITHUB_REF_NAME}-linux.tar.gz"
+          tar -czf "Battlezone_ModEngine-${{ steps.version.outputs.tag }}-linux.tar.gz" -C dist BZModEngine
+          ls -lh "Battlezone_ModEngine-${{ steps.version.outputs.tag }}-linux.tar.gz"
 
       - name: Attest build provenance
         uses: actions/attest-build-provenance@v1
@@ -100,9 +114,22 @@ jobs:
   release:
     needs: build
     runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: "${{ startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'push' && github.ref == 'refs/heads/main' && startsWith(github.event.head_commit.message, 'chore(release): v')) }}"
 
     steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve release tag
+        id: release_version
+        shell: bash
+        run: |
+          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
+            tag="$GITHUB_REF_NAME"
+          else
+            tag="v$(tr -d '[:space:]' < VERSION)"
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
       - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
@@ -111,6 +138,9 @@ jobs:
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ steps.release_version.outputs.tag }}
+          name: ${{ steps.release_version.outputs.tag }}
+          target_commitish: ${{ github.sha }}
           files: |
             artifacts/Battlezone_ModEngine-windows/Battlezone_ModEngine-v*-windows.zip
             artifacts/Battlezone_ModEngine-linux/Battlezone_ModEngine-v*-linux.tar.gz
