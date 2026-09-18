@@ -678,31 +678,32 @@ class BZModMaster:
 
     def toggle_ui_mode(self):
         advanced = self.advanced_mode_var.get()
-        
-        # 0: Game Path, 1: SteamCMD, 2: Cache
-        self.set_row_visibility(0, show_row=advanced, simple=not advanced)
-        self.set_row_visibility(1, show_row=advanced, simple=not advanced)
-        self.set_row_visibility(2, show_row=True, simple=not advanced)
-        
-        # Update Cache Label
-        cache_widgets = self.path_ui_elements[2]
-        cache_widgets['label'].config(text="Download Folder:" if not advanced else cache_widgets['default_text'])
 
-        # Update Simple Mode Texts
+        # Simple Mode presents status, not raw filesystem plumbing.
+        self.set_row_visibility(0, show_row=advanced, simple=False)  # Game Path
+        self.set_row_visibility(1, show_row=advanced, simple=False)  # SteamCMD
+        self.set_row_visibility(2, show_row=advanced, simple=False)  # Mod Engine Cache
+        self.set_row_visibility(3, show_row=advanced, simple=False)  # Native Steam Workshop
+
+        cache_widgets = self.path_ui_elements[2]
+        cache_widgets['label'].config(text=cache_widgets['default_text'])
+
         if not advanced:
+            self.simple_detect_btn.pack(side="left", padx=(0, 5))
+            self.simple_browse_btn.pack(side="left")
             self.thumb_label.config(text="DRAG MOD LINK HERE\nOR COPY/PASTE")
             self.mod_url_label.config(text="PASTE WORKSHOP LINK HERE:")
         else:
+            self.simple_detect_btn.pack_forget()
+            self.simple_browse_btn.pack_forget()
             self.thumb_label.config(text="ADD MOD\nLINK OR ID")
             self.mod_url_label.config(text="MOD URL OR ID:")
 
-        # Buttons
         if not advanced:
             self.workshop_btn.pack_forget()
             self.launch_btn.pack_forget()
             self.stop_btn.pack_forget()
         else:
-            # Repack to ensure order
             for btn in [self.dl_btn, self.launch_btn, self.workshop_btn, self.stop_btn]:
                 btn.pack_forget()
             self.dl_btn.pack(side="left", padx=(0, 5))
@@ -710,25 +711,33 @@ class BZModMaster:
             self.workshop_btn.pack(side="left", padx=5)
             self.stop_btn.pack(side="left", padx=5)
 
+        self.update_install_ui()
+
     def set_row_visibility(self, index, show_row, simple):
         widgets = self.path_ui_elements[index]
+        browse = widgets.get('browse')
         if show_row:
             widgets['label'].grid()
             widgets['entry'].grid()
-            widgets['browse'].grid()
-            
+            if browse is not None:
+                browse.grid()
+
             if simple:
                 widgets['help'].grid_remove()
-                for w in widgets['extras']: w.grid_remove()
+                for w in widgets['extras']:
+                    w.grid_remove()
             else:
                 widgets['help'].grid()
-                for w in widgets['extras']: w.grid()
+                for w in widgets['extras']:
+                    w.grid()
         else:
             widgets['label'].grid_remove()
             widgets['entry'].grid_remove()
-            widgets['browse'].grid_remove()
+            if browse is not None:
+                browse.grid_remove()
             widgets['help'].grid_remove()
-            for w in widgets['extras']: w.grid_remove()
+            for w in widgets['extras']:
+                w.grid_remove()
 
     def update_styles(self, style):
         main_font = (self.current_font, 10)
@@ -1234,6 +1243,7 @@ class BZModMaster:
                 self.game_install_sources[self.current_game_key] = "configured"
                 self.game_workshop_dirs[self.current_game_key] = ""
                 self.save_config()
+                self.update_install_ui()
             self.log(f"Game path updated: {p}", "success")
 
     def browse_steamcmd(self): 
@@ -1340,7 +1350,7 @@ class BZModMaster:
         candidate = self.path_var.get() if path is None else path
         return is_valid_game_path(self.games[resolved_key], candidate)
 
-    def auto_detect_game(self, verbose=False):
+      def auto_detect_game(self, verbose=False):
         game_key = self.current_game_key
         game = self.games[game_key]
         previous_path = self.path_var.get()
@@ -1357,15 +1367,9 @@ class BZModMaster:
             self.game_install_sources[game_key] = result.source
             self.game_workshop_dirs[game_key] = result.workshop_content_dir or ""
             self.save_config()
+            self.update_install_ui()
 
-            source_labels = {
-                "configured": "Configured path",
-                "steam": "Steam",
-                "gog": "GOG",
-                "uninstall": "Windows installed-app registry",
-                "heroic": "Heroic",
-            }
-            source_label = source_labels.get(result.source, result.source.title())
+            source_label = get_install_source_label(result.source)
             path_changed = not self.paths_match(previous_path, result.path)
             if result.source != "configured" and (path_changed or verbose):
                 self.log(f"{source_label} installation detected: {result.path}", "success")
@@ -1377,6 +1381,7 @@ class BZModMaster:
 
         self.game_install_sources[game_key] = ""
         self.game_workshop_dirs[game_key] = ""
+        self.update_install_ui()
         if verbose:
             messagebox.showwarning(
                 "Not Found",
