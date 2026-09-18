@@ -1756,19 +1756,32 @@ class BZModMaster:
         ).start()
 
     def delete_mod_physically(self):
-        """Wipes the selected mods from the SteamCMD cache and breaks any links."""
+        """Delete managed cache copies and break links without touching Steam-owned files."""
         selected = self.tree.selection()
-        if not selected: return
+        if not selected:
+            return
 
-        count = len(selected)
+        mods_to_delete = [str(self.tree.item(item)['values'][1]) for item in selected]
+        steam_managed = [
+            mid for mid in mods_to_delete
+            if self.mod_source_kinds.get(mid) == "steam"
+        ]
+        count = len(mods_to_delete)
+
         if count == 1:
-            mid = str(self.tree.item(selected[0])['values'][1])
-            prompt_message = f"Permanently delete Mod ID {mid} from disk?"
+            prompt_message = f"Remove Mod ID {mods_to_delete[0]} from the Mod Engine?"
         else:
-            prompt_message = f"Permanently delete {count} selected mods from disk?"
+            prompt_message = f"Remove {count} selected mods from the Mod Engine?"
+
+        if steam_managed:
+            prompt_message += (
+                "\n\nSteam-managed Workshop files will NOT be deleted. "
+                "Only links and any Mod Engine cached copies are removed."
+            )
+        else:
+            prompt_message += "\n\nThis deletes the Mod Engine cached copy from disk."
 
         if messagebox.askyesno("TERMINATE ASSET(S)", prompt_message):
-            mods_to_delete = [str(self.tree.item(item)['values'][1]) for item in selected]
             cache_path = self.cache_var.get()
             game_context = self.build_game_context()
             self.start_task()
