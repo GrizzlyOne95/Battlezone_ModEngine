@@ -80,7 +80,8 @@ def get_windows_steam_roots(winreg_module, env=None) -> list[str]:
     if winreg_module is None:
         return []
 
-    env = env or os.environ
+    if env is None:
+        env = os.environ
     roots = []
 
     locations = [
@@ -101,6 +102,7 @@ def get_windows_steam_roots(winreg_module, env=None) -> list[str]:
             continue
         for wow_flag in wow_flags:
             key = None
+            found_in_key = False
             try:
                 key = winreg_module.OpenKey(hive, key_path, 0, key_read | wow_flag)
                 for value_name in value_names:
@@ -108,10 +110,11 @@ def get_windows_steam_roots(winreg_module, env=None) -> list[str]:
                         value, _ = winreg_module.QueryValueEx(key, value_name)
                         if value:
                             roots.append(value)
+                            found_in_key = True
                             break
                     except OSError:
                         continue
-                if roots:
+                if found_in_key:
                     # Do not keep opening the same logical key through alternate WOW views.
                     break
             except OSError:
