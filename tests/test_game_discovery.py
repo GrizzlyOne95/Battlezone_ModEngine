@@ -12,6 +12,8 @@ from game_discovery import (
     discover_windows_gog_game,
     discover_windows_uninstall_game,
     extract_steam_library_paths,
+    format_install_status,
+    get_install_source_label,
     get_linux_heroic_paths,
     get_linux_steam_roots,
     get_windows_gog_paths,
@@ -65,6 +67,19 @@ class FakeWinreg:
 
 
 class GameDiscoveryTests(unittest.TestCase):
+    def test_install_status_labels_are_concise(self):
+        self.assertEqual(get_install_source_label("steam"), "Steam")
+        self.assertEqual(get_install_source_label("gog"), "GOG")
+        self.assertEqual(
+            format_install_status("steam", True),
+            "Steam • Detected ✓",
+        )
+        self.assertEqual(
+            format_install_status("configured", True),
+            "Configured Path • Detected ✓",
+        )
+        self.assertEqual(format_install_status("steam", False), "Not Detected")
+
     def test_valid_game_path_requires_expected_executable(self):
         game = {"exe": "battlezone98redux.exe"}
         with tempfile.TemporaryDirectory() as temp_dir:
