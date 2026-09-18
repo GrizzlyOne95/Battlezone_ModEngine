@@ -8,12 +8,13 @@ Download the latest platform archive from the GitHub Releases page. Packaged app
 
 - Windows launcher: `BZModEngine.exe`
 - Linux launcher: `BZModEngine`
-- Application folder: `BZModEngine`
+- macOS launcher: `BZModEngine`
 
 Release archives carry the version and platform, for example:
 
-- `Battlezone_ModEngine-v1.0.10-windows.zip`
-- `Battlezone_ModEngine-v1.0.10-linux.tar.gz`
+- `Battlezone_ModEngine-v1.0.12-windows.zip`
+- `Battlezone_ModEngine-v1.0.12-linux.tar.gz`
+- `Battlezone_ModEngine-v1.0.12-macos.tar.gz`
 
 Official Windows builds use the shared **Battlezone Modding Tools** product identity:
 
@@ -24,7 +25,7 @@ CompanyName: GrizzlyOne95
 OriginalFilename: BZModEngine.exe
 ```
 
-`FileVersion` and `ProductVersion` are derived from the release tag. Non-release CI builds use neutral `0.0.0` Windows metadata.
+`FileVersion` and `ProductVersion` are derived from the canonical repository version.
 
 <img width="1727" height="1323" alt="image" src="https://github.com/user-attachments/assets/3aeebf39-91f9-4ae7-9fc9-6dcdfd7ac581" />
 
@@ -39,11 +40,12 @@ OriginalFilename: BZModEngine.exe
 *   **Smart Linking**: Uses Windows Junctions or Linux symlinks to link mods to the game folder without duplicating files.
 *   **Physical Copy Fallback**: Automatically switches to Physical Copy when junctions are not supported.
 *   **Auto-Detection**: Locates GOG, Heroic, and Steam installations automatically on both Windows and Linux.
-*   **Cross-Platform**: Works on Windows 10/11 and Linux (tested with Arch).
+*   **Cross-Platform**: Works on Windows, Linux, and macOS.
 
 ## Requirements
 *   **Windows**: Windows 10/11
 *   **Linux**: Any modern distribution with Python 3 and tkinter
+*   **macOS**: A modern macOS release capable of running the packaged Python/Tk application
 *   Battlezone 98 Redux or Battlezone Combat Commander (GOG, Heroic, or Steam version)
 
 ## Installation
@@ -66,11 +68,19 @@ python cmd.py
 *   **From Source**: Install dependencies (`pip install Pillow tkinterdnd2`) and run `cmd.py`.
 *   **Junctions require NTFS**. If your game is on exFAT or FAT32, the app will offer a Physical Copy fallback.
 
+### macOS
+```bash
+python3 -m pip install -r requirements.txt
+python3 cmd.py
+```
+
+Official releases also provide a standalone `BZModEngine` executable for macOS.
+
 ## Release Integrity (Attestations)
 Official releases include build attestations to maximize user trust. You can verify attestations on the GitHub Releases page for each version, or build from source using `cmd.py` and the instructions above.
 
 ## Usage
-1.  Run the application (normal user is fine on Windows and Linux).
+1.  Run the application (normal user is fine on Windows, Linux, and macOS).
 2.  **Downloader Tab**:
     *   Ensure Game Path and SteamCMD paths are correct.
     *   Paste a Steam Workshop URL or ID. You can also drag a link from Steam right into the box!
