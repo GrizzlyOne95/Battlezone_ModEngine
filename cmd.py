@@ -12,7 +12,6 @@ from io import BytesIO
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 import webbrowser
-from pathlib import Path
 
 from config_utils import get_user_config_dir as util_get_user_config_dir, load_config as util_load_config, save_config as util_save_config
 from deploy_utils import (
@@ -1252,6 +1251,7 @@ class BZModMaster:
             game,
             configured_path=self.path_var.get(),
             is_windows=IS_WINDOWS,
+            is_linux=IS_LINUX,
             winreg_module=winreg,
         )
 
@@ -1264,6 +1264,8 @@ class BZModMaster:
                 "configured": "Configured path",
                 "steam": "Steam",
                 "gog": "GOG",
+                "uninstall": "Windows installed-app registry",
+                "heroic": "Heroic",
             }
             source_label = source_labels.get(result.source, result.source.title())
             if result.source != "configured":
@@ -1272,54 +1274,11 @@ class BZModMaster:
                 messagebox.showinfo("Success", f"Game found via {source_label}:\n{result.path}")
             return True
 
-        # Keep the existing Linux heuristics until the Linux/Heroic discovery phase.
-        if IS_LINUX and self.auto_detect_linux_legacy(verbose=False):
-            if verbose:
-                messagebox.showinfo("Success", f"Game found at:\n{self.path_var.get()}")
-            return True
-
         if verbose:
             messagebox.showwarning(
                 "Not Found",
                 "Could not automatically locate this game. Please browse to the installation folder.",
             )
-        return False
-
-    def auto_detect_linux_legacy(self, verbose=False):
-        found_path = None
-
-        if IS_LINUX:
-            home = Path.home()
-            game_exe = self.games[self.current_game_key]["exe"]
-
-            candidates = [
-                # Heroic GOG installations
-                home / "Games" / "GOG" / "Battlezone 98 Redux",
-                home / "Games" / "Heroic" / "Battlezone 98 Redux",
-                # Steam installations
-                home / ".local" / "share" / "Steam" / "steamapps" / "common" / "Battlezone 98 Redux",
-                home / ".steam" / "steam" / "steamapps" / "common" / "Battlezone 98 Redux",
-                # Manual installations
-                home / "games" / "battlezone98redux",
-                home / ".wine" / "drive_c" / "GOG Games" / "Battlezone 98 Redux",
-            ]
-
-            for path in candidates:
-                exe_path = path / game_exe
-                if exe_path.exists():
-                    found_path = str(path)
-                    break
-
-        if found_path and is_valid_game_path(self.games[self.current_game_key], found_path):
-            self.path_var.set(found_path)
-            self.game_install_source = "legacy-linux"
-            self.save_config()
-            if verbose:
-                messagebox.showinfo("Success", f"Game found at:\n{found_path}")
-            return True
-
-        if verbose:
-            messagebox.showwarning("Not Found", "Could not automatically locate the Linux installation.")
         return False
 
     def auto_detect_steamcmd(self, verbose=False):
