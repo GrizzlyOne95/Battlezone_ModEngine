@@ -36,8 +36,9 @@ pyz = PYZ(a.pure)
 exe = EXE(
     pyz,
     a.scripts,
+    a.binaries,
+    a.datas,
     [],
-    exclude_binaries=True,
     name='BZModEngine',
     debug=False,
     bootloader_ignore_signals=False,
@@ -53,13 +54,3 @@ exe = EXE(
     version=version_file,
 )
 
-coll = COLLECT(
-    exe,
-    a.binaries,
-    a.zipfiles,
-    a.datas,
-    strip=False,
-    upx=True,
-    upx_exclude=[],
-    name='BZModEngine',
-)
