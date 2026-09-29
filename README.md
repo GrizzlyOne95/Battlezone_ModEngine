@@ -76,6 +76,9 @@ python3 bz_mod_engine.py
 
 Official releases also provide a standalone `BZModEngine` executable for macOS.
 
+## Publishing a Release
+Bump the version in `VERSION` and merge the change into `main` (any merge method). CI builds all three platforms and publishes `v<VERSION>` with its archives, attestations and generated release notes. A version that already has a tag is never re-released, so later pushes to `main` only build. To re-run a missed release, start the **Build and Release** workflow manually on `main`, or push a `v<VERSION>` tag.
+
 ## Release Integrity (Attestations)
 Official releases include build attestations to maximize user trust. You can verify attestations on the GitHub Releases page for each version, or build from source using `bz_mod_engine.py` and the instructions above.
 
