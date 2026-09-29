@@ -161,27 +161,41 @@ jobs:
           path: Battlezone_ModEngine-*-macos.tar.gz
           if-no-files-found: error
 
-  release:
-    needs: build
+  # Decide whether this run publishes a release:
+  # - a pushed v* tag always releases that tag;
+  # - on main (push or manual run), VERSION releases when v<VERSION> is not
+  #   tagged yet, so bumping VERSION releases regardless of how the change
+  #   was merged, and later pushes never re-release an existing version.
+  check-release:
     runs-on: ubuntu-latest
     permissions:
-      contents: write
-    if: "${{ startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'push' && github.ref == 'refs/heads/main' && startsWith(github.event.head_commit.message, 'chore(release): v')) }}"
+      contents: read
+    outputs:
+      should_release: ${{ steps.check.outputs.should_release }}
+      tag: ${{ steps.check.outputs.tag }}
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
-      - name: Resolve release tag
-        id: release_version
+      - name: Check whether VERSION is unreleased
+        id: check
         shell: bash
-        run: |
-          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
-            tag="$GITHUB_REF_NAME"
-          else
-            tag="v$(tr -d '[:space:]' < VERSION)"
-          fi
-          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+        run: bash scripts/check_release.sh
 
+  release:
+    needs: [build, check-release]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    if: needs.check-release.outputs.should_release == 'true'
+    # Never publish two releases at once (e.g. quick successive pushes to main).
+    concurrency:
+      group: release
+      cancel-in-progress: false
+
+    steps:
       - name: Download all artifacts
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
@@ -190,8 +204,8 @@ jobs:
       - name: Create Release
         uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3
         with:
-          tag_name: ${{ steps.release_version.outputs.tag }}
-          name: ${{ steps.release_version.outputs.tag }}
+          tag_name: ${{ needs.check-release.outputs.tag }}
+          name: ${{ needs.check-release.outputs.tag }}
           target_commitish: ${{ github.sha }}
           files: |
             artifacts/Battlezone_ModEngine-windows/Battlezone_ModEngine-v*-windows.zip
