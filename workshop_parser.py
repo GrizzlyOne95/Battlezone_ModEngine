@@ -62,15 +62,36 @@ def parse_workshop_metadata(html: str) -> WorkshopMetadata:
     if not thumb_match:
         thumb_match = re.search(r'<link rel="image_src" href="([^"]+)">', html)
 
-    date_match = re.search(r'<(?:div|span) class="detailsStatRight">([^<]+)</(?:div|span)>', html)
     title = clean_html_text(title_match.group(1)) if title_match else None
 
     return WorkshopMetadata(
         title=title,
         appid=app_match.group(1) if app_match else None,
         thumbnail_url=thumb_match.group(1) if thumb_match else None,
-        remote_date_text=clean_html_text(date_match.group(1)) if date_match else None,
+        remote_date_text=select_remote_date_text(html),
     )
+
+
+def select_remote_date_text(html: str) -> str | None:
+    """Return the most recent date shown in the Workshop details stats.
+
+    The stats column lists File Size, Posted and (when present) Updated, in that
+    order, so the first entry is not a date. The last entry that parses as a
+    date is the "Updated" date, or "Posted" for items never updated.
+    """
+    stats = re.findall(r'<(?:div|span) class="detailsStatRight">([^<]+)</(?:div|span)>', html)
+    for raw in reversed(stats):
+        text = clean_html_text(raw)
+        if parse_workshop_datetime(text) is not None:
+            return text
+    return None
+
+
+def classify_workshop_app(metadata: WorkshopMetadata, expected_appid: str) -> str:
+    """Return "valid", "wrong_game", or "unknown" for a fetched Workshop page."""
+    if not metadata.appid:
+        return "unknown"
+    return "valid" if metadata.appid == str(expected_appid) else "wrong_game"
 
 
 def parse_workshop_datetime(date_text: str | None, now: datetime | None = None) -> datetime | None:

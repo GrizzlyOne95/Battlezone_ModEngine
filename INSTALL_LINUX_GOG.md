@@ -140,7 +140,7 @@ pip install tkinterdnd2
 
 ### Launch the Mod Engine:
 ```bash
-python cmd.py &
+python bz_mod_engine.py &
 ```
 
 ## Step 7: Configure the Mod Engine
@@ -263,7 +263,7 @@ heroic &
 
 # Launch Mod Engine
 cd ~/Battlezone_ModEngine
-python cmd.py &
+python bz_mod_engine.py &
 
 # Run game directly
 cd ~/Games/GOG/Battlezone\ 98\ Redux/
