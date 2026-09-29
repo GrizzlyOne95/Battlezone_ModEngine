@@ -19,7 +19,7 @@ datas = [
 datas += collect_data_files('tkinterdnd2')
 
 a = Analysis(
-    ['cmd.py'],
+    ['bz_mod_engine.py'],
     pathex=[],
     binaries=[],
     datas=datas,

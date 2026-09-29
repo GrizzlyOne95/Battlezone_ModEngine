@@ -61,23 +61,23 @@ sudo apt install python3 python3-pil python3-tk  # Debian/Ubuntu
 pip install tkinterdnd2
 
 # Run the application
-python cmd.py
+python bz_mod_engine.py
 ```
 
 ### Windows
-*   **From Source**: Install dependencies (`pip install Pillow tkinterdnd2`) and run `cmd.py`.
+*   **From Source**: Install dependencies (`pip install Pillow tkinterdnd2`) and run `bz_mod_engine.py`.
 *   **Junctions require NTFS**. If your game is on exFAT or FAT32, the app will offer a Physical Copy fallback.
 
 ### macOS
 ```bash
 python3 -m pip install -r requirements.txt
-python3 cmd.py
+python3 bz_mod_engine.py
 ```
 
 Official releases also provide a standalone `BZModEngine` executable for macOS.
 
 ## Release Integrity (Attestations)
-Official releases include build attestations to maximize user trust. You can verify attestations on the GitHub Releases page for each version, or build from source using `cmd.py` and the instructions above.
+Official releases include build attestations to maximize user trust. You can verify attestations on the GitHub Releases page for each version, or build from source using `bz_mod_engine.py` and the instructions above.
 
 ## Usage
 1.  Run the application (normal user is fine on Windows, Linux, and macOS).
