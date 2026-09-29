@@ -2,5 +2,8 @@ bz_mod_config.json
 dist/
 build/
 *.spec
+!build.spec
 __pycache__/
 *config.json
+workshop_cache/
+bin/

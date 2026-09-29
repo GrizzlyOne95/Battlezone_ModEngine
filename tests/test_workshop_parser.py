@@ -3,6 +3,7 @@ from datetime import datetime
 
 from workshop_parser import (
     WorkshopMetadata,
+    classify_workshop_app,
     extract_required_item_ids,
     is_remote_newer,
     parse_workshop_datetime,
@@ -32,7 +33,44 @@ SAMPLE_HTML = """
 """
 
 
+# Mirrors the Workshop page layout: the stats column lists File Size, Posted
+# and Updated, in that order.
+STATS_HTML = """
+<div class="detailsStatsContainerRight">
+    <div class="detailsStatRight">12.345 MB</div>
+    <div class="detailsStatRight">23 Oct, 2016 @ 3:47pm</div>
+    <div class="detailsStatRight">4 Mar, 2019 @ 11:02am</div>
+</div>
+"""
+
+POSTED_ONLY_HTML = """
+<div class="detailsStatsContainerRight">
+    <div class="detailsStatRight">1.2 MB</div>
+    <div class="detailsStatRight">23 Oct, 2016 @ 3:47pm</div>
+</div>
+"""
+
+
 class WorkshopParserTests(unittest.TestCase):
+    def test_remote_date_uses_updated_not_file_size(self):
+        self.assertEqual(parse_workshop_metadata(STATS_HTML).remote_date_text, "4 Mar, 2019 @ 11:02am")
+
+    def test_remote_date_falls_back_to_posted(self):
+        self.assertEqual(parse_workshop_metadata(POSTED_ONLY_HTML).remote_date_text, "23 Oct, 2016 @ 3:47pm")
+
+    def test_update_detection_with_realistic_stats(self):
+        local_ts = datetime(2017, 1, 1, 12, 0).timestamp()
+        remote = parse_workshop_metadata(STATS_HTML).remote_date_text
+        self.assertTrue(is_remote_newer(remote, local_ts))
+
+    def test_classify_workshop_app(self):
+        def meta(appid):
+            return WorkshopMetadata(title=None, appid=appid, thumbnail_url=None, remote_date_text=None)
+
+        self.assertEqual(classify_workshop_app(meta("301650"), "301650"), "valid")
+        self.assertEqual(classify_workshop_app(meta("624970"), "301650"), "wrong_game")
+        self.assertEqual(classify_workshop_app(meta(None), "301650"), "unknown")
+
     def test_extract_required_item_ids_deduplicates_and_sorts(self):
         self.assertEqual(extract_required_item_ids(SAMPLE_HTML), ["111", "222"])
 

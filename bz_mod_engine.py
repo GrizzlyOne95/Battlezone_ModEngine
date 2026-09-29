@@ -1,11 +1,11 @@
 import os
 import sys
 import re
-import shutil
 import zipfile
 import subprocess
 import threading
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 import platform
 from datetime import datetime
 from io import BytesIO
@@ -24,9 +24,15 @@ from deploy_utils import (
     deploy_mod as util_deploy_mod,
     ensure_cache_root as util_ensure_cache_root,
     get_cache_marker_path as util_get_cache_marker_path,
+    get_latest_mtime,
+    is_link_or_junction,
     is_safe_cache_root as util_is_safe_cache_root,
     normalize_path as util_normalize_path,
     paths_match as util_paths_match,
+    is_same_or_nested_path,
+    list_unexpected_cache_entries,
+    paths_overlap,
+    remove_path as util_remove_path,
 )
 from game_discovery import (
     discover_game_install,
@@ -40,16 +46,20 @@ from platform_utils import (
     get_steamcmd_candidates as util_get_steamcmd_candidates,
     get_steamcmd_name as util_get_steamcmd_name,
     open_path as util_open_path,
+    terminate_process_tree,
 )
 from steamcmd_utils import (
     build_workshop_download_command,
     classify_workshop_items,
     ensure_console_language_file,
     parse_steamcmd_output_line,
+    safe_extract_zip,
     should_log_noisy_line,
+    summarize_download_batch,
 )
-from task_utils import TaskState, calculate_batch_progress
+from task_utils import TaskState, TtlCache, UiDispatcher, calculate_batch_progress
 from workshop_parser import (
+    classify_workshop_app,
     extract_required_item_ids,
     is_remote_newer,
     parse_workshop_metadata,
@@ -85,6 +95,12 @@ STEAMCMD_URL = "https://steamcdn-a.akamaihd.net/client/installer/steamcmd.zip"
 CONFIG_FILE = "bz_mod_config.json"
 CACHE_MARKER_FILE = ".bz_mod_cache"
 HTTP_TIMEOUT = 15
+UI_POLL_MS = 50
+# Workshop metadata is re-used across list refreshes (enable/disable/delete all
+# trigger one) instead of re-fetching every item from Steam each time.
+METADATA_TTL_SECONDS = 600
+MAX_METADATA_FETCHES = 4
+PREVIEW_DEBOUNCE_MS = 400
 APP_USER_MODEL_ID = "GrizzlyOne95.Battlezone.ModEngine"
 
 
@@ -243,7 +259,13 @@ class BZModMaster:
 
         self.mod_id_var = tk.StringVar()
         self.image_cache = {}
-        self.is_valid_mod = False
+        # (game_key, mod_id) of the last Workshop item confirmed to belong to
+        # the selected game. Downloads are only allowed for that exact item.
+        self.validated_mod = None
+        self._preview_after_id = None
+        self.metadata_cache = TtlCache(METADATA_TTL_SECONDS)
+        self.metadata_executor = ThreadPoolExecutor(max_workers=MAX_METADATA_FETCHES)
+        self.refresh_generation = 0
         self.game_install_sources = {}
         self.game_workshop_dirs = {}
         self.mod_source_paths = {}
@@ -254,6 +276,8 @@ class BZModMaster:
         self.active_processes = []
         self.task_lock = threading.Lock()
         self.task_state = TaskState()
+        self.ui_dispatcher = UiDispatcher()
+        self.root.after(UI_POLL_MS, self._drain_ui_queue)
 
         try:
             self.ensure_cache_root(self.cache_var.get())
@@ -268,7 +292,22 @@ class BZModMaster:
         self.auto_detect_game()
         if not self.steamcmd_var.get(): self.auto_detect_steamcmd()
         self.toggle_ui_mode()
-        threading.Thread(target=self.initialize_engine, daemon=True).start()
+        self.initialize_engine()
+
+    def shutdown(self):
+        """Stop background work so queued Workshop lookups don't delay exit."""
+        self.refresh_generation += 1
+        self.stop_operation()
+        self.metadata_executor.shutdown(wait=False, cancel_futures=True)
+        self.root.destroy()
+
+    def ui(self, callback):
+        """Run ``callback`` on the Tk main thread. Safe to call from any thread."""
+        self.ui_dispatcher.post(callback)
+
+    def _drain_ui_queue(self):
+        self.ui_dispatcher.drain()
+        self.root.after(UI_POLL_MS, self._drain_ui_queue)
 
     def load_custom_fonts(self):
         self.available_fonts = []
@@ -281,7 +320,7 @@ class BZModMaster:
                     # Check return value: > 0 means success
                     if ctypes.windll.gdi32.AddFontResourceExW(font_path, 0x10, 0) > 0:
                         self.available_fonts.append(g["font_name"])
-                except: pass
+                except Exception: pass
 
     def load_game_icons(self):
         self.game_icons = {}
@@ -292,7 +331,7 @@ class BZModMaster:
                 if os.path.exists(p):
                     img = Image.open(p).resize((48, 48), Image.Resampling.LANCZOS)
                     self.game_icons[key] = ImageTk.PhotoImage(img)
-            except: pass
+            except Exception: pass
 
     def apply_theme_vars(self):
         g = self.games[self.current_game_key]
@@ -358,16 +397,23 @@ class BZModMaster:
         with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as response:
             return response.read().decode("utf-8", errors="replace")
 
-    def fetch_url_bytes(self, url):
+    def fetch_url_bytes(self, url, timeout=HTTP_TIMEOUT):
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as response:
+        with urllib.request.urlopen(req, timeout=timeout) as response:
             return response.read()
 
     def create_directory_link(self, src, dst):
         util_create_directory_link(src, dst, IS_WINDOWS)
 
     def deploy_mod(self, mid, src, dst, use_physical):
-        deployed = util_deploy_mod(src, dst, use_physical, self.remove_existing_path, self.create_directory_link)
+        deployed = util_deploy_mod(
+            src,
+            dst,
+            use_physical,
+            self.remove_path_strict,
+            self.create_directory_link,
+            is_link=self.is_junction,
+        )
         if not deployed and not os.path.exists(src):
             self.log(f"Mod source missing for {mid}: {src}", "error")
         return deployed
@@ -836,8 +882,6 @@ class BZModMaster:
         self.save_config()
         
         if self.mod_id_var.get():
-            self.is_valid_mod = False
-            self.mod_name_label.config(text="VALIDATING...", foreground=c['fg'])
             self.on_input_change()
 
     def clear_hud_log(self):
@@ -846,7 +890,7 @@ class BZModMaster:
         self.log_box.config(state="disabled")
 
     def log(self, message, tag=None):
-        self.root.after(0, lambda: self._log_impl(message, tag))
+        self.ui(lambda: self._log_impl(message, tag))
 
     def _log_impl(self, message, tag=None):
         # Simple Mode Filter: Only show tagged messages (Success, Warning, Error, Info)
@@ -870,25 +914,25 @@ class BZModMaster:
             transition = self.task_state.start_task()
             if transition.entered_busy:
                 self.stop_event.clear()
-                self.root.after(0, lambda: self.stop_btn.config(state="normal"))
-                self.root.after(0, lambda: self.game_selector.config(state="disabled"))
+                self.ui(lambda: self.stop_btn.config(state="normal"))
+                self.ui(lambda: self.game_selector.config(state="disabled"))
 
     def end_task(self, callback=None):
         with self.task_lock:
             transition = self.task_state.end_task()
             if transition.became_idle:
-                self.root.after(0, lambda: self.stop_btn.config(state="disabled"))
-                self.root.after(0, lambda: self.game_selector.config(state="readonly"))
-                self.root.after(0, self.reset_progress)
+                self.ui(lambda: self.stop_btn.config(state="disabled"))
+                self.ui(lambda: self.game_selector.config(state="readonly"))
+                self.ui(self.reset_progress)
                 if callback:
-                    self.root.after(1000, callback)
+                    self.ui(lambda: self.root.after(1000, callback))
 
     def stop_operation(self):
         self.stop_event.set()
         self.log("Stopping operations...", "warning")
         for p in list(self.active_processes):
-            try: p.terminate()
-            except: pass
+            try: terminate_process_tree(p, IS_WINDOWS)
+            except Exception: pass
 
     def get_dependencies(self, mid):
         """Scrapes the Steam Workshop page for required items."""
@@ -946,10 +990,14 @@ class BZModMaster:
             self.root.after(2000, lambda: self.dl_btn.config(text="INSTALL MOD", state="normal"))
             return
         
-        # FINAL GATEKEEPER: Check validation flag
-        if hasattr(self, 'is_valid_mod') and not self.is_valid_mod:
+        # FINAL GATEKEEPER: only the exact item that was confirmed for this game.
+        if self.validated_mod != (self.current_game_key, mid):
             current_game_name = self.games[self.current_game_key]["name"]
-            messagebox.showerror("Validation Error", f"Target Mod ID does not belong to {current_game_name}.\nDownload Aborted.")
+            messagebox.showerror(
+                "Validation Error",
+                f"Mod ID {mid} has not been verified as a {current_game_name} Workshop item.\n"
+                "Wait for the preview to load, or check the ID and your connection.\nDownload Aborted.",
+            )
             return
 
         if not self.begin_download_batch():
@@ -972,20 +1020,22 @@ class BZModMaster:
                 deps = self.get_dependencies(mid)
             except Exception as e:
                 self.log(f"Dependency Check Failed: {e}", "warning")
-            self.root.after(0, lambda: self._prompt_deps_and_start(queue, deps, sc_path, cache_path, game_context))
+            self.ui(lambda: self._prompt_deps_and_start(queue, deps, sc_path, cache_path, game_context))
 
         threading.Thread(target=deps_worker, daemon=True).start()
 
     def download_logic(self, mod_ids, sc_path, cache_path, game_context, use_physical):
         if isinstance(mod_ids, str):
             mod_ids = [mod_ids]
+        final_button_text = "FAILED"
         try:
             current_appid = game_context["appid"]
             game_path = game_context["game_path"]
             final_sc_path = self.ensure_steamcmd(sc_path)
             cache = self.ensure_cache_root(cache_path)
-            
-            ensure_console_language_file(final_sc_path)
+
+            if ensure_console_language_file(final_sc_path) is None:
+                self.log("Could not write SteamConsole.txt next to SteamCMD; continuing without it.")
 
             total_items = len(mod_ids)
             self.log(f"Batch processing {total_items} items...", "info")
@@ -997,85 +1047,105 @@ class BZModMaster:
                     self.log(f"Queueing download: {mid}", "info")
 
             cmd = build_workshop_download_command(final_sc_path, cache, current_appid, mod_ids)
-            
+
             p = subprocess.Popen(cmd, **self.get_popen_output_kwargs())
             self.active_processes.append(p)
-            
+
             completed_count = 0
-            
+            succeeded = set()
             last_log_time = 0
-            
-            while True:
-                if self.stop_event.is_set():
-                    p.terminate()
-                    break
-                line = p.stdout.readline()
-                if not line:
-                    break
-                
-                event = parse_steamcmd_output_line(line)
-                current_time = datetime.now().timestamp()
 
-                if event["kind"] == "empty":
-                    continue
-                if event["kind"] == "success":
-                    completed_count += 1
-                    self.log(f"Success: {event['item']} ({completed_count}/{total_items})", "success")
-                    self.root.after(0, lambda c=completed_count, t=total_items: self.update_batch_progress(0, c, t))
-                elif event["kind"] == "error":
-                    self.log(event["message"], "error")
-                elif event["kind"] == "progress":
-                    self.root.after(0, lambda v=event["value"], c=completed_count, t=total_items: self.update_batch_progress(v, c, t))
-                elif event["kind"] == "verifying":
-                    self.root.after(0, lambda c=completed_count, t=total_items: self.dl_btn.config(text=f"VERIFYING {c+1}/{t}..."))
-                elif event["kind"] == "noisy":
-                    if should_log_noisy_line(current_time, last_log_time):
+            try:
+                while True:
+                    if self.stop_event.is_set():
+                        terminate_process_tree(p, IS_WINDOWS)
+                        break
+                    line = p.stdout.readline()
+                    if not line:
+                        break
+
+                    event = parse_steamcmd_output_line(line)
+                    current_time = datetime.now().timestamp()
+
+                    if event["kind"] == "empty":
+                        continue
+                    if event["kind"] == "success":
+                        completed_count += 1
+                        succeeded.add(event["item"])
+                        self.log(f"Success: {event['item']} ({completed_count}/{total_items})", "success")
+                        self.ui(lambda c=completed_count, t=total_items: self.update_batch_progress(0, c, t))
+                    elif event["kind"] == "error":
+                        self.log(event["message"], "error")
+                    elif event["kind"] == "progress":
+                        self.ui(lambda v=event["value"], c=completed_count, t=total_items: self.update_batch_progress(v, c, t))
+                    elif event["kind"] == "verifying":
+                        self.ui(lambda c=completed_count, t=total_items: self.dl_btn.config(text=f"VERIFYING {c+1}/{t}..."))
+                    elif event["kind"] == "noisy":
+                        if should_log_noisy_line(current_time, last_log_time):
+                            self.log(event["message"])
+                            last_log_time = current_time
+                    elif event["kind"] == "info":
                         self.log(event["message"])
-                        last_log_time = current_time
-                elif event["kind"] == "info":
-                    self.log(event["message"])
 
-            p.wait()
-            if p in self.active_processes:
-                self.active_processes.remove(p)
-            if p.returncode not in (0, None) and not self.stop_event.is_set():
+                try:
+                    p.wait(timeout=30)
+                except subprocess.TimeoutExpired:
+                    p.kill()
+                    p.wait()
+            finally:
+                if p in self.active_processes:
+                    self.active_processes.remove(p)
+
+            if self.stop_event.is_set():
+                # Items may be half-downloaded; deploying them (especially in
+                # Physical Copy mode, which replaces the game's copy) would break
+                # working installs.
+                self.log("Download cancelled. No mods were deployed from this batch.", "warning")
+                final_button_text = "CANCELLED"
+                return
+
+            if p.returncode not in (0, None):
                 self.log(f"SteamCMD exited with code {p.returncode}.", "warning")
 
-            # Process Links for all items
-            for mid in mod_ids:
+            outcome = summarize_download_batch(
+                mod_ids,
+                succeeded,
+                lambda mid: os.path.exists(self.build_mod_cache_path(cache, current_appid, mid)),
+            )
+            for mid in outcome["stale"]:
+                self.log(f"Update failed for {mid}; keeping the previously downloaded version.", "warning")
+            for mid in outcome["missing"]:
+                self.log(f"Download failed for {mid}: SteamCMD did not produce the item.", "error")
+
+            deploy_failures = 0
+            for mid in outcome["downloaded"] + outcome["stale"]:
                 src = os.path.normpath(self.build_mod_cache_path(cache, current_appid, mid))
                 dst = os.path.normpath(os.path.join(game_path, "mods", mid))
-                
-                if os.path.exists(src):
-                    deployed_ok = False
-                    try:
-                        deployed_ok = self.deploy_mod(mid, src, dst, use_physical)
-                    except subprocess.TimeoutExpired:
-                        self.log(f"Link creation timed out for {mid}", "error")
-                    except subprocess.CalledProcessError as e:
-                        err = e.stderr.strip() if e.stderr else "Unknown error"
-                        self.log(f"Link creation failed for {mid}: {err}", "error")
-                    except Exception as e:
-                        self.log(f"Link creation failed for {mid}: {e}", "error")
-                    if deployed_ok:
-                        self.log(f"Deployment complete: {mid}", "success")
-                    else:
-                        self.log(f"Deployment failed: {mid}", "error")
-            
-            self.root.after(0, lambda: self.dl_btn.config(text="DEPLOYED"))
-            self.root.after(3000, lambda: self.dl_btn.config(text="INSTALL MOD", state="normal"))
-            
+
+                deployed_ok = False
+                try:
+                    deployed_ok = self.deploy_mod(mid, src, dst, use_physical)
+                except Exception as e:
+                    self.log(f"Link creation failed for {mid}: {e}", "error")
+                if deployed_ok:
+                    self.log(f"Deployment complete: {mid}", "success")
+                else:
+                    deploy_failures += 1
+                    self.log(f"Deployment failed: {mid}", "error")
+
+            for mid in outcome["downloaded"]:
+                self.metadata_cache.discard(mid)
+            final_button_text = outcome["status"]
+            if deploy_failures:
+                final_button_text = "FAILED" if deploy_failures == total_items else "PARTIAL"
+
         except Exception as e:
             self.log(f"CRITICAL: {e}", "error")
         finally:
+            self.ui(lambda text=final_button_text: self.dl_btn.config(text=text))
+            self.ui(lambda: self.root.after(3000, lambda: self.dl_btn.config(text="INSTALL MOD", state="normal")))
             self.release_download_batch()
             self.end_task(self.refresh_list if not self.stop_event.is_set() else None)
-
-    def update_progress(self, value):
-        self.progress.stop()
-        self.progress.config(mode="determinate", value=value)
-        self.progress_label.config(text=f"DOWNLOADING {int(value)}%")
-        if value < 100: self.dl_btn.config(text=f"DOWNLOADING {int(value)}%")
 
     def reset_progress(self):
         self.progress.stop()
@@ -1083,40 +1153,66 @@ class BZModMaster:
         self.progress_label.config(text="IDLE", fg="#666666")
 
     def on_input_change(self, *args):
+        # Any edit invalidates the previous verdict until the new ID is checked.
+        self.validated_mod = None
         mid = self.sanitize_id(self.mod_id_var.get())
-        if mid and len(mid) >= 8:
-            game_context = self.build_game_context()
-            threading.Thread(target=self.fetch_preview, args=(mid, game_context), daemon=True).start()
+        if self._preview_after_id is not None:
+            self.root.after_cancel(self._preview_after_id)
+            self._preview_after_id = None
+        if mid:
+            self.mod_name_label.config(text="VALIDATING...", foreground=self.colors['fg'])
+            # Debounce so typing an ID does not send one Steam request per keystroke.
+            self._preview_after_id = self.root.after(PREVIEW_DEBOUNCE_MS, lambda: self._start_preview_fetch(mid))
+
+    def _start_preview_fetch(self, mid):
+        self._preview_after_id = None
+        if self.sanitize_id(self.mod_id_var.get()) != mid:
+            return
+        game_context = self.build_game_context()
+        threading.Thread(target=self.fetch_preview, args=(mid, game_context), daemon=True).start()
+
     def open_workshop(self):
         appid = self.games[self.current_game_key]["appid"]
         webbrowser.open(f"https://steamcommunity.com/app/{appid}/workshop/")
+
     def fetch_preview(self, mid, game_context):
+        """Worker thread: fetch Workshop metadata; all UI/state updates go via self.ui."""
+        game_key = game_context["key"]
         try:
             url = f"https://steamcommunity.com/sharedfiles/filedetails/?id={mid}&l=english"
             html = self.fetch_url_text(url)
             metadata = parse_workshop_metadata(html)
-            target_appid = game_context["appid"]
-            current_app = metadata.appid
-
-            if not self.is_active_preview_request(game_context["key"], mid):
-                return
-
-            if current_app and current_app != target_appid:
-                self.is_valid_mod = False
-                self.root.after(0, lambda: self.update_preview_title(game_context["key"], mid, "INVALID GAME DETECTED", "#ff0000"))
-                return
-
-            self.is_valid_mod = True
-            title = metadata.title or f"ID: {mid}"
-
-            self.root.after(0, lambda: self.update_preview_title(game_context["key"], mid, title, self.colors['accent']))
-            if HAS_PIL and metadata.thumbnail_url:
-                raw = self.fetch_url_bytes(metadata.thumbnail_url)
-                img = Image.open(BytesIO(raw)).resize((150, 150), Image.Resampling.LANCZOS)
-                photo = ImageTk.PhotoImage(img)
-                self.root.after(0, lambda p=photo: self.update_preview_image(game_context["key"], mid, p))
         except Exception as e:
             self.log(f"Metadata Fetch Error: {e}", "error")
+            self.ui(lambda: self.update_preview_title(game_key, mid, "VALIDATION FAILED", "#ff4444"))
+            return
+
+        verdict = classify_workshop_app(metadata, game_context["appid"])
+        if verdict == "wrong_game":
+            self.ui(lambda: self.update_preview_title(game_key, mid, "INVALID GAME DETECTED", "#ff0000"))
+            return
+        if verdict == "unknown":
+            self.ui(lambda: self.update_preview_title(game_key, mid, "ITEM NOT FOUND", "#ff4444"))
+            return
+
+        title = metadata.title or f"ID: {mid}"
+        self.ui(lambda: self.mark_mod_validated(game_key, mid, title))
+
+        if HAS_PIL and metadata.thumbnail_url:
+            try:
+                raw = self.fetch_url_bytes(metadata.thumbnail_url)
+                img = Image.open(BytesIO(raw)).resize((150, 150), Image.Resampling.LANCZOS)
+                img.load()
+            except Exception as e:
+                self.log(f"Preview image error: {e}")
+                return
+            self.ui(lambda: self.update_preview_image(game_key, mid, img))
+
+    def mark_mod_validated(self, game_key, mid, title):
+        if not self.is_active_preview_request(game_key, mid):
+            return
+        self.validated_mod = (game_key, mid)
+        self.mod_name_label.config(text=title, foreground=self.colors['accent'])
 
     def is_active_preview_request(self, game_key, mid):
         return game_key == self.current_game_key and self.sanitize_id(self.mod_id_var.get()) == mid
@@ -1126,10 +1222,11 @@ class BZModMaster:
             return
         self.mod_name_label.config(text=title, foreground=color)
 
-    def update_preview_image(self, game_key, mid, photo):
+    def update_preview_image(self, game_key, mid, image):
         if not self.is_active_preview_request(game_key, mid):
             return
-        self.update_thumb(photo)
+        # PhotoImage is a Tk object, so it is created here on the main thread.
+        self.update_thumb(ImageTk.PhotoImage(image))
 
     def update_thumb(self, photo):
         self.thumb_label.config(image=photo)
@@ -1141,7 +1238,7 @@ class BZModMaster:
     def paste_from_clipboard(self):
         try:
             self.mod_id_var.set(self.root.clipboard_get())
-        except: pass
+        except Exception: pass
 
     def sanitize_id(self, input_str):
         match = re.search(r'id=(\d+)', input_str)
@@ -1172,7 +1269,7 @@ class BZModMaster:
     def ensure_steamcmd(self, target):
         if not target:
             target = self.get_default_steamcmd_path()
-            self.root.after(0, lambda: self.steamcmd_var.set(target))
+            self.ui(lambda: self.steamcmd_var.set(target))
             
         if not os.path.exists(target):
             if not IS_WINDOWS:
@@ -1183,8 +1280,10 @@ class BZModMaster:
             os.makedirs(target_dir, exist_ok=True)
             zip_p = os.path.join(target_dir, "sc.zip")
             try:
-                urllib.request.urlretrieve(STEAMCMD_URL, zip_p)
-                with zipfile.ZipFile(zip_p, 'r') as z: z.extractall(target_dir)
+                with open(zip_p, "wb") as handle:
+                    handle.write(self.fetch_url_bytes(STEAMCMD_URL, timeout=120))
+                with zipfile.ZipFile(zip_p, 'r') as z:
+                    safe_extract_zip(z, target_dir)
                 os.remove(zip_p)
                 self.log("SteamCMD installed successfully.", "success")
             except Exception as e:
@@ -1231,8 +1330,11 @@ class BZModMaster:
             new_path = os.path.normpath(p)
             cache_path = self.cache_var.get()
             
-            if self.paths_match(cache_path, new_path):
-                messagebox.showerror("Path Conflict", "Game Path cannot be the same as Mod Cache Path.\nPlease select a different folder.")
+            if is_same_or_nested_path(cache_path, new_path):
+                messagebox.showerror(
+                    "Path Conflict",
+                    "Game Path cannot be the Mod Cache folder or inside it.\nPlease select a different folder.",
+                )
                 return
 
             self.path_var.set(new_path)
@@ -1287,11 +1389,19 @@ class BZModMaster:
             new_path = os.path.normpath(p)
             game_path = self.path_var.get()
             
-            if self.paths_match(game_path, new_path):
-                messagebox.showerror("Path Conflict", "Mod Cache Path cannot be the same as Game Path.\nPlease select a different folder.")
+            conflict = self.find_cache_path_conflict(new_path)
+            if conflict:
+                messagebox.showerror("Path Conflict", conflict + "\nPlease select a different folder.")
                 return
 
             self.ensure_cache_root(new_path)
+            if not self.is_safe_cache_root(new_path):
+                messagebox.showwarning(
+                    "Folder Not Empty",
+                    "This folder already contains other files, so it was not marked as a Mod Engine cache.\n\n"
+                    "Downloads will still work, but CLEAR and mod removal will refuse to delete anything here.\n"
+                    "Choose an empty folder to avoid this.",
+                )
             self.cache_var.set(new_path)
             self.save_config()
             
@@ -1312,15 +1422,50 @@ class BZModMaster:
             self.open_path(target)
         else: messagebox.showinfo("Info", "Path does not exist.")
 
+    def find_cache_path_conflict(self, cache_path):
+        """Return an error message when clearing ``cache_path`` could delete important folders."""
+        if is_same_or_nested_path(cache_path, self.path_var.get()):
+            return "Mod Cache cannot be the Game folder or a folder containing it."
+        if is_same_or_nested_path(cache_path, self.base_dir):
+            return "Mod Cache cannot be the Mod Engine's own folder or a folder containing it."
+        if is_same_or_nested_path(cache_path, self.bin_dir):
+            return "Mod Cache cannot contain the SteamCMD folder."
+        workshop_dir = self.game_workshop_dirs.get(self.current_game_key, "")
+        if workshop_dir and paths_overlap(cache_path, workshop_dir):
+            return "Mod Cache cannot overlap Steam's own Workshop folder."
+        return None
+
     def clear_cache(self):
         cache_path = self.cache_var.get()
         if not cache_path or not os.path.exists(cache_path):
             messagebox.showinfo("Cache Empty", "The cache folder does not exist.")
             return
 
-        cache_root = self.ensure_cache_root(cache_path)
+        cache_root = os.path.abspath(cache_path)
+        # Never create the marker here: it is what authorises this deletion.
         if not self.is_safe_cache_root(cache_root):
-            messagebox.showerror("Unsafe Cache Path", "Refusing to clear a cache path that is not marked as an app cache.")
+            messagebox.showerror(
+                "Unsafe Cache Path",
+                "Refusing to clear this folder: it is not marked as a Mod Engine cache "
+                "(it contained other files when it was selected).",
+            )
+            return
+
+        conflict = self.find_cache_path_conflict(cache_root)
+        if conflict:
+            messagebox.showerror("Unsafe Cache Path", f"Refusing to clear the cache.\n{conflict}")
+            return
+
+        # Older versions marked any selected folder, so also refuse folders that
+        # hold anything SteamCMD did not create.
+        unexpected = list_unexpected_cache_entries(cache_root, CACHE_MARKER_FILE)
+        if unexpected is None or unexpected:
+            shown = ", ".join((unexpected or [])[:5]) or "unreadable folder"
+            messagebox.showerror(
+                "Unsafe Cache Path",
+                "Refusing to clear this folder because it contains files the Mod Engine did not create:\n"
+                f"{shown}",
+            )
             return
 
         if messagebox.askyesno("Clear Cache", f"Are you sure you want to delete all files in:\n{cache_path}\n\nThis will force re-download of all mods."):
@@ -1337,10 +1482,28 @@ class BZModMaster:
 
 
     def launch_game(self):
-        exe = os.path.join(self.path_var.get(), self.games[self.current_game_key]["exe"])
+        game = self.games[self.current_game_key]
+        exe = os.path.join(self.path_var.get(), game["exe"])
         if os.path.exists(exe):
+            try:
+                if IS_WINDOWS:
+                    subprocess.Popen([exe], cwd=self.path_var.get())
+                elif self.game_install_sources.get(self.current_game_key) == "steam":
+                    # The game is a Windows build; let Steam start it through Proton.
+                    self.open_path(f"steam://rungameid/{game['appid']}")
+                else:
+                    messagebox.showinfo(
+                        "Launch From Your Launcher",
+                        "This is a Windows game build. Start it from Heroic, Lutris, Wine or "
+                        "whichever launcher you installed it with; enabled mods are picked up automatically.",
+                    )
+                    return
+            except Exception as e:
+                self.log(f"Launch failed: {e}", "error")
+                self.launch_btn.config(text="LAUNCH FAILED")
+                self.root.after(2000, lambda: self.launch_btn.config(text="LAUNCH GAME"))
+                return
             self.launch_btn.config(text="LAUNCHING...")
-            subprocess.Popen([exe], cwd=self.path_var.get())
             self.root.after(5000, lambda: self.launch_btn.config(text="LAUNCH GAME"))
         else:
             self.launch_btn.config(text="EXE MISSING")
@@ -1467,7 +1630,7 @@ class BZModMaster:
     def refresh_list(self):
         """Scan the managed SteamCMD cache plus any detected Steam Workshop source."""
         self.progress_label.config(text="SCANNING...", fg=self.colors['accent'])
-        self.image_cache.clear()
+        self.refresh_generation += 1
         self.progress.config(mode="indeterminate"); self.progress.start(10)
 
         cache_path = self.cache_var.get()
@@ -1483,7 +1646,7 @@ class BZModMaster:
 
             if not game_dir:
                 self.log("SCAN FAILED: Game path is not configured.", "error")
-                self.root.after(0, lambda: self._populate_tree([], game_context))
+                self.ui(lambda: self._populate_tree([], game_context))
                 return
 
             current_appid = game_context["appid"]
@@ -1510,7 +1673,7 @@ class BZModMaster:
                     "No Workshop content found in: " + " | ".join(locations),
                     "warning",
                 )
-                self.root.after(0, lambda: self._populate_tree([], game_context))
+                self.ui(lambda: self._populate_tree([], game_context))
                 return
 
             cache_count = sum(1 for value in mod_sources.values() if value["source"] == "cache")
@@ -1536,7 +1699,7 @@ class BZModMaster:
                 status = "ENABLED" if is_enabled else "DISABLED"
 
                 try:
-                    m_time = os.path.getmtime(mod_path)
+                    m_time = get_latest_mtime(mod_path)
                     dt = datetime.fromtimestamp(m_time).strftime('%Y-%m-%d')
                 except Exception:
                     m_time = 0
@@ -1546,7 +1709,7 @@ class BZModMaster:
                     (mid, status, is_enabled, m_time, dt, mod_path, source_kind)
                 )
 
-            self.root.after(0, lambda: self._populate_tree(scan_data, game_context))
+            self.ui(lambda: self._populate_tree(scan_data, game_context))
         finally:
             self.end_task()
 
@@ -1570,13 +1733,18 @@ class BZModMaster:
             else:
                 self.tree.item(item, tags=('inactive',))
 
-            threading.Thread(
-                target=self.fetch_mod_info_for_tree,
-                args=(item, mid, m_time, status, game_context),
-                daemon=True
-            ).start()
+            cached_photo = self.image_cache.get(mid)
+            if cached_photo is not None:
+                self.tree.item(item, image=cached_photo)
 
-        self.root.after(0, self.update_tree_tags)
+            # A bounded pool keeps large mod lists from firing hundreds of
+            # simultaneous requests at Steam.
+            self.metadata_executor.submit(
+                self.fetch_mod_info_for_tree,
+                item, mid, m_time, status, game_context, self.refresh_generation,
+            )
+
+        self.ui(self.update_tree_tags)
 
     def safe_tree_set(self, item, col, value):
         try:
@@ -1617,18 +1785,28 @@ class BZModMaster:
             return
         self.set_tree_image(item, raw_data, mid)
 
-    def fetch_mod_info_for_tree(self, item, mid, local_ts, base_status, game_context):
-        """Fetches mod name and checks for updates."""
-        try:
+    def get_workshop_metadata(self, mid):
+        """Fetch (and cache) the Workshop page metadata for a mod."""
+        metadata = self.metadata_cache.get(mid)
+        if metadata is None:
             url = f"https://steamcommunity.com/sharedfiles/filedetails/?id={mid}&l=english"
-            html = self.fetch_url_text(url)
-            metadata = parse_workshop_metadata(html)
+            metadata = parse_workshop_metadata(self.fetch_url_text(url))
+            self.metadata_cache.set(mid, metadata)
+        return metadata
+
+    def fetch_mod_info_for_tree(self, item, mid, local_ts, base_status, game_context, generation):
+        """Worker: fetch mod name and check for updates."""
+        game_key = game_context["key"]
+        if generation != self.refresh_generation:
+            return  # The list was refreshed again; this row no longer exists.
+        try:
+            metadata = self.get_workshop_metadata(mid)
             title = metadata.title or mid
 
-            if HAS_PIL and metadata.thumbnail_url:
+            if HAS_PIL and metadata.thumbnail_url and mid not in self.image_cache:
                 try:
                     raw = self.fetch_url_bytes(metadata.thumbnail_url)
-                    self.root.after(0, lambda: self.set_tree_image_for_game(game_context["key"], item, raw, mid))
+                    self.ui(lambda: self.set_tree_image_for_game(game_key, item, raw, mid))
                 except Exception:
                     pass
 
@@ -1638,17 +1816,19 @@ class BZModMaster:
             final_status = base_status
             if is_out_of_date:
                 final_status = f"{base_status} (OUT OF DATE)"
-                self.root.after(0, lambda: self.add_tree_tag_for_game(game_context["key"], item, "update_needed"))
+                self.ui(lambda: self.add_tree_tag_for_game(game_key, item, "update_needed"))
                 v_status = f"Remote: {remote_date_str}"
-            else:
+            elif metadata.remote_date_text:
                 v_status = "UP TO DATE"
+            else:
+                v_status = "Unknown"
 
-            self.root.after(0, lambda: self.safe_tree_set_for_game(game_context["key"], item, "Name", title))
-            self.root.after(0, lambda: self.safe_tree_set_for_game(game_context["key"], item, "Version", v_status))
-            self.root.after(0, lambda: self.safe_tree_set_for_game(game_context["key"], item, "Status", final_status))
-        except:
-            self.root.after(0, lambda: self.safe_tree_set_for_game(game_context["key"], item, "Name", f"ID: {mid} (Fetch Error)"))
-            self.root.after(0, lambda: self.safe_tree_set_for_game(game_context["key"], item, "Status", base_status))
+            self.ui(lambda: self.safe_tree_set_for_game(game_key, item, "Name", title))
+            self.ui(lambda: self.safe_tree_set_for_game(game_key, item, "Version", v_status))
+            self.ui(lambda: self.safe_tree_set_for_game(game_key, item, "Status", final_status))
+        except Exception:
+            self.ui(lambda: self.safe_tree_set_for_game(game_key, item, "Name", f"ID: {mid} (Fetch Error)"))
+            self.ui(lambda: self.safe_tree_set_for_game(game_key, item, "Status", base_status))
 
     def enable_mod(self):
         """Enable selected mods from either the managed cache or detected Steam Workshop."""
@@ -1713,16 +1893,10 @@ class BZModMaster:
                 
                 try:
                     if os.path.lexists(dst):
-                        if IS_WINDOWS:
-                            # In Windows, 'os.rmdir' is the correct way to remove a Junction 
-                            # without deleting the contents of the source folder.
-                            if os.path.isdir(dst):
-                                os.rmdir(dst) 
-                            else:
-                                os.remove(dst) # Handle file symlinks
-                        else:
-                            # Linux: Remove symlink
-                            os.unlink(dst)
+                        # Links/junctions are removed without touching their target;
+                        # Physical Copy deployments are real folders and are deleted
+                        # (the source copy stays in the cache or Steam library).
+                        self.remove_path_strict(dst)
                         self.log(f"Mod {mid} decoupled from game engine.", "info")
                 except Exception as e:
                     self.log(f"DECOUPLE ERROR for {mid}: {e}", "error")
@@ -1730,11 +1904,9 @@ class BZModMaster:
             self.end_task(self.refresh_list if not self.stop_event.is_set() else None)
 
     def is_junction(self, path):
-        """Helper to detect if a directory is a Windows Junction or Linux symlink."""
-        if IS_WINDOWS and ctypes:
-            return bool(os.path.isdir(path) and (ctypes.windll.kernel32.GetFileAttributesW(path) & 0x400))
-        else:
-            return os.path.islink(path)
+        """Detect a Windows junction/reparse point or a symlink."""
+        get_attributes = ctypes.windll.kernel32.GetFileAttributesW if (IS_WINDOWS and ctypes) else None
+        return is_link_or_junction(path, IS_WINDOWS, get_attributes)
 
     def get_fs_type(self, path):
         if not IS_WINDOWS or not ctypes or not path:
@@ -1804,20 +1976,17 @@ class BZModMaster:
         self.log("Deployment aborted: Junctions not supported on game drive.", "error")
         return None
 
+    def remove_path_strict(self, path):
+        """Remove a link, junction, file or folder; raises on failure."""
+        util_remove_path(path, self.is_junction)
+
     def remove_existing_path(self, path):
         try:
-            if not os.path.lexists(path):
-                return
-            if IS_WINDOWS and self.is_junction(path):
-                os.rmdir(path)
-            elif os.path.islink(path):
-                os.unlink(path)
-            elif os.path.isdir(path):
-                shutil.rmtree(path)
-            else:
-                os.remove(path)
+            self.remove_path_strict(path)
+            return True
         except Exception as e:
             self.log(f"Failed to remove existing path: {path} ({e})", "warning")
+            return False
 
     def update_all_mods(self):
         """Batch triggers SteamCMD for every out-of-date item currently in the list."""
@@ -1894,10 +2063,14 @@ class BZModMaster:
 
     def _delete_mod_worker(self, mods, cache_path, game_context):
         try:
-            cache_root = self.ensure_cache_root(cache_path)
-            if not self.is_safe_cache_root(cache_root):
-                self.log("Refusing to delete from an unsafe cache path.", "error")
-                return
+            cache_root = os.path.abspath(cache_path) if cache_path else ""
+            # The marker is never created here: it is what authorises deletion.
+            cache_is_safe = self.is_safe_cache_root(cache_root)
+            if not cache_is_safe:
+                self.log(
+                    "Mod Cache is not marked as a Mod Engine cache; only game links will be removed.",
+                    "warning",
+                )
 
             for mid in mods:
                 if self.stop_event.is_set():
@@ -1905,24 +2078,24 @@ class BZModMaster:
 
                 link_path = os.path.join(game_context["game_path"], "mods", mid)
                 if os.path.lexists(link_path):
-                    try:
-                        self.remove_existing_path(link_path)
-                    except Exception as e:
-                        self.log(f"Note: Could not remove link for {mid} during purge: {e}", "warning")
+                    self.remove_existing_path(link_path)
+
+                if not cache_is_safe:
+                    continue
 
                 mod_cache_path = self.build_mod_cache_path(cache_root, game_context["appid"], mid)
-                try:
-                    if os.path.exists(mod_cache_path):
-                        self.remove_existing_path(mod_cache_path)
+                if os.path.exists(mod_cache_path):
+                    if self.remove_existing_path(mod_cache_path):
+                        self.metadata_cache.discard(mid)
                         self.log(f"Asset {mid} purged from the Mod Engine cache.", "warning")
-                    elif self.mod_source_kinds.get(mid) == "steam":
-                        self.log(
-                            f"Asset {mid} is Steam-managed; external Workshop content was left untouched.",
-                            "warning",
-                        )
-                except Exception as e:
-                    self.log(f"Purge Error for {mid}: {e}", "error")
-                
+                    else:
+                        self.log(f"Purge Error for {mid}: the cached copy could not be removed.", "error")
+                elif self.mod_source_kinds.get(mid) == "steam":
+                    self.log(
+                        f"Asset {mid} is Steam-managed; external Workshop content was left untouched.",
+                        "warning",
+                    )
+
         finally:
             self.end_task(self.refresh_list if not self.stop_event.is_set() else None)
 
@@ -1968,4 +2141,5 @@ class BZModMaster:
 if __name__ == "__main__":
     root = TkinterDnD.Tk() if HAS_DND else tk.Tk()
     app = BZModMaster(root)
+    root.protocol("WM_DELETE_WINDOW", app.shutdown)
     root.mainloop()
