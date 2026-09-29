@@ -1,13 +1,17 @@
+import io
 import os
 import tempfile
 import unittest
+import zipfile
 
 from steamcmd_utils import (
     build_workshop_download_command,
     classify_workshop_items,
     ensure_console_language_file,
     parse_steamcmd_output_line,
+    safe_extract_zip,
     should_log_noisy_line,
+    summarize_download_batch,
 )
 
 
@@ -64,6 +68,70 @@ class SteamCmdUtilsTests(unittest.TestCase):
         self.assertEqual(parse_steamcmd_output_line("Update state (0x61)")["kind"], "ignore")
         self.assertEqual(parse_steamcmd_output_line("Downloading item...")["kind"], "noisy")
         self.assertEqual(parse_steamcmd_output_line("Random status")["kind"], "info")
+
+    def test_real_steamcmd_failure_lines_are_errors(self):
+        for line in [
+            "ERROR! Download item 1234567 failed (Failure).",
+            "ERROR! Timeout downloading item 1234567",
+            "ERROR! Download item 1234567 failed (File Not Found).",
+        ]:
+            self.assertEqual(parse_steamcmd_output_line(line)["kind"], "error", line)
+
+    def test_benign_startup_noise_is_not_an_error(self):
+        for line in [
+            'ILocalize::AddFile() failed to load file "public/steambootstrapper_english.txt".',
+            "Failed to init SDL priority manager: SDL not found",
+            "Loading Steam API...OK",
+        ]:
+            self.assertEqual(parse_steamcmd_output_line(line)["kind"], "info", line)
+
+    def test_success_line_yields_bare_item_id(self):
+        event = parse_steamcmd_output_line(
+            'Success. Downloaded item 1234567 to "/cache/steamapps/workshop/content/301650/1234567" (4096 bytes)'
+        )
+        self.assertEqual(event["kind"], "success")
+        self.assertEqual(event["item"], "1234567")
+
+    def test_ensure_console_language_file_tolerates_unwritable_dir(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            missing_dir = os.path.join(temp_dir, "not-a-dir", "steamcmd")
+            self.assertIsNone(ensure_console_language_file(missing_dir))
+
+    def test_safe_extract_zip_rejects_path_traversal(self):
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w") as archive:
+            archive.writestr("../evil.txt", "x")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            target = os.path.join(temp_dir, "target")
+            os.makedirs(target)
+            with zipfile.ZipFile(buffer) as archive:
+                with self.assertRaises(ValueError):
+                    safe_extract_zip(archive, target)
+            self.assertFalse(os.path.exists(os.path.join(temp_dir, "evil.txt")))
+
+    def test_safe_extract_zip_extracts_normal_archive(self):
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w") as archive:
+            archive.writestr("steamcmd.exe", "x")
+            archive.writestr("package/readme.txt", "y")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with zipfile.ZipFile(buffer) as archive:
+                safe_extract_zip(archive, temp_dir)
+            self.assertTrue(os.path.isfile(os.path.join(temp_dir, "package", "readme.txt")))
+
+    def test_summarize_download_batch(self):
+        on_disk = {"1", "2"}
+        all_ok = summarize_download_batch(["1", "2"], {"1", "2"}, on_disk.__contains__)
+        self.assertEqual(all_ok["status"], "DEPLOYED")
+
+        mixed = summarize_download_batch(["1", "2", "3"], {"1"}, on_disk.__contains__)
+        self.assertEqual(mixed["downloaded"], ["1"])
+        self.assertEqual(mixed["stale"], ["2"])
+        self.assertEqual(mixed["missing"], ["3"])
+        self.assertEqual(mixed["status"], "PARTIAL")
+
+        none = summarize_download_batch(["3"], set(), on_disk.__contains__)
+        self.assertEqual(none["status"], "FAILED")
 
     def test_should_log_noisy_line(self):
         self.assertFalse(should_log_noisy_line(10.5, 10.0))

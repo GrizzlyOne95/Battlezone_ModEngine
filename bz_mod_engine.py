@@ -1,0 +1,2145 @@
+import os
+import sys
+import re
+import zipfile
+import subprocess
+import threading
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor
+import platform
+from datetime import datetime
+from io import BytesIO
+import tkinter as tk
+from tkinter import ttk, messagebox, filedialog
+import webbrowser
+
+from config_utils import get_user_config_dir as util_get_user_config_dir, load_config as util_load_config, save_config as util_save_config
+from deploy_utils import (
+    build_content_dir as util_build_content_dir,
+    build_game_context as util_build_game_context,
+    build_mod_cache_path as util_build_mod_cache_path,
+    clear_directory_contents as util_clear_directory_contents,
+    collect_workshop_mod_sources as util_collect_workshop_mod_sources,
+    create_directory_link as util_create_directory_link,
+    deploy_mod as util_deploy_mod,
+    ensure_cache_root as util_ensure_cache_root,
+    get_cache_marker_path as util_get_cache_marker_path,
+    get_latest_mtime,
+    is_link_or_junction,
+    is_safe_cache_root as util_is_safe_cache_root,
+    normalize_path as util_normalize_path,
+    paths_match as util_paths_match,
+    is_same_or_nested_path,
+    list_unexpected_cache_entries,
+    paths_overlap,
+    remove_path as util_remove_path,
+)
+from game_discovery import (
+    discover_game_install,
+    format_install_status,
+    get_install_source_label,
+    is_valid_game_path,
+)
+from platform_utils import (
+    get_default_steamcmd_path as util_get_default_steamcmd_path,
+    get_popen_output_kwargs as util_get_popen_output_kwargs,
+    get_steamcmd_candidates as util_get_steamcmd_candidates,
+    get_steamcmd_name as util_get_steamcmd_name,
+    open_path as util_open_path,
+    terminate_process_tree,
+)
+from steamcmd_utils import (
+    build_workshop_download_command,
+    classify_workshop_items,
+    ensure_console_language_file,
+    parse_steamcmd_output_line,
+    safe_extract_zip,
+    should_log_noisy_line,
+    summarize_download_batch,
+)
+from task_utils import TaskState, TtlCache, UiDispatcher, calculate_batch_progress
+from workshop_parser import (
+    classify_workshop_app,
+    extract_required_item_ids,
+    is_remote_newer,
+    parse_workshop_metadata,
+)
+
+# Platform-specific imports
+IS_WINDOWS = platform.system() == "Windows"
+IS_LINUX = platform.system() == "Linux"
+
+if IS_WINDOWS:
+    import winreg
+    import ctypes
+else:
+    winreg = None
+    ctypes = None
+
+# --- EXTERNAL LIBRARIES ---
+try:
+    from PIL import Image, ImageTk
+    HAS_PIL = True
+except ImportError:
+    HAS_PIL = False
+
+try:
+    # Requires: pip install tkinterdnd2
+    from tkinterdnd2 import DND_TEXT, TkinterDnD
+    HAS_DND = True
+except ImportError:
+    HAS_DND = False
+
+# --- CONFIGURATION ---
+STEAMCMD_URL = "https://steamcdn-a.akamaihd.net/client/installer/steamcmd.zip"
+CONFIG_FILE = "bz_mod_config.json"
+CACHE_MARKER_FILE = ".bz_mod_cache"
+HTTP_TIMEOUT = 15
+UI_POLL_MS = 50
+# Workshop metadata is re-used across list refreshes (enable/disable/delete all
+# trigger one) instead of re-fetching every item from Steam each time.
+METADATA_TTL_SECONDS = 600
+MAX_METADATA_FETCHES = 4
+PREVIEW_DEBOUNCE_MS = 400
+APP_USER_MODEL_ID = "GrizzlyOne95.Battlezone.ModEngine"
+
+
+def _set_app_user_model_id():
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes as _ctypes
+
+        _ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(APP_USER_MODEL_ID)
+    except Exception:
+        pass
+
+
+def _resolve_bundled_icon(name):
+    """Locate a bundled icon working from source and under sys._MEIPASS."""
+    candidates = []
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        candidates.append(os.path.join(meipass, "branding", name))
+        candidates.append(os.path.join(meipass, name))
+    here = os.path.dirname(os.path.abspath(__file__))
+    candidates.append(os.path.join(here, "branding", name))
+    candidates.append(os.path.join(here, name))
+    for path in candidates:
+        if os.path.exists(path):
+            return path
+    return None
+
+
+def apply_window_icon(window):
+    """Apply the canonical app icon to a Tk/Toplevel window."""
+    try:
+        ico_path = _resolve_bundled_icon("app_icon.ico")
+        if ico_path:
+            try:
+                window.iconbitmap(ico_path)
+            except Exception:
+                pass
+        png_path = _resolve_bundled_icon("app_icon.png")
+        if png_path:
+            try:
+                image = tk.PhotoImage(file=png_path)
+                window.iconphoto(True, image)
+                window._battlezone_app_icon = image
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
+_set_app_user_model_id()
+
+class ToolTip:
+    def __init__(self, widget, text, bg="#1a1a1a", fg="#00ffff"):
+        self.widget = widget
+        self.text = text
+        self.bg = bg
+        self.fg = fg
+        self.tip_window = None
+        widget.bind("<Enter>", self.show_tip)
+        widget.bind("<Leave>", self.hide_tip)
+
+    def show_tip(self, event=None):
+        x = self.widget.winfo_rootx() + 25
+        y = self.widget.winfo_rooty() + 20
+        self.tip_window = tw = tk.Toplevel(self.widget)
+        tw.wm_overrideredirect(True)
+        tw.wm_geometry(f"+{x}+{y}")
+        label = tk.Label(tw, text=self.text, justify='left',
+                       background=self.bg, foreground=self.fg, 
+                       relief='solid', borderwidth=1, font=("Consolas", "9"))
+        label.pack(ipadx=1)
+
+    def hide_tip(self, event=None):
+        if self.tip_window:
+            self.tip_window.destroy()
+            self.tip_window = None
+
+class BZModMaster:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Battlezone Mod Engine")
+        self.root.geometry("1150x850")
+        
+        if getattr(sys, 'frozen', False):
+            self.base_dir = os.path.dirname(sys.executable)
+            self.resource_dir = sys._MEIPASS
+        else:
+            self.base_dir = os.path.dirname(os.path.abspath(__file__))
+            self.resource_dir = self.base_dir
+
+        self.config_dir = self.get_user_config_dir()
+        self.config_path = os.path.join(self.config_dir, CONFIG_FILE)
+        self.legacy_config_path = os.path.join(self.base_dir, CONFIG_FILE)
+
+        # --- GAME DEFINITIONS ---
+        self.games = {
+            "BZ98R": {
+                "name": "Battlezone 98 Redux",
+                "appid": "301650",
+                "gog_ids": ["1454067812", "1459427445"],
+                "aliases": ["Battlezone98Redux", "BZ98R"],
+                "exe": "battlezone98redux.exe",
+                "font_file": "BZONE.ttf",
+                "font_name": "BZONE",
+                "icon_file": "bz98.png",
+                "colors": {
+                    "bg": "#0a0a0a", "fg": "#d4d4d4",
+                    "highlight": "#00ff00", "dark_highlight": "#004400", "accent": "#00ffff"
+                }
+            },
+            "BZCC": {
+                "name": "Battlezone Combat Commander",
+                "appid": "624970",
+                "gog_ids": ["1193046833"],
+                "aliases": ["BZCC", "BattlezoneCombatCommander"],
+                "exe": "battlezone2.exe",
+                "font_file": "BGM.ttf",
+                "font_name": "BankGothic",
+                "icon_file": "bz2.png",
+                "colors": {
+                    "bg": "#0a0a0a", "fg": "#d4d4d4",
+                    "highlight": "#00aaff", "dark_highlight": "#002244", "accent": "#88ccff"
+                }
+            }
+        }
+
+        self.load_custom_fonts()
+        self.load_game_icons()
+
+        apply_window_icon(self.root)
+
+        self.bin_dir = os.path.join(self.base_dir, "bin")
+        self.config = self.load_config()
+        
+        # Determine active game
+        self.current_game_key = self.config.get("last_game", "BZ98R")
+        if self.current_game_key not in self.games: self.current_game_key = "BZ98R"
+        
+        self.apply_theme_vars()
+        self.root.configure(bg=self.colors["bg"])
+
+        self.use_physical_var = tk.BooleanVar(value=self.config.get("use_physical", False))
+        self.advanced_mode_var = tk.BooleanVar(value=self.config.get("advanced_mode", False))
+        
+        # Load game-specific path or fallback to legacy global path
+        saved_path = self.config.get(f"path_{self.current_game_key}", "")
+        if not saved_path and self.current_game_key == "BZ98R":
+            saved_path = self.config.get("game_path", "")
+            
+        self.path_var = tk.StringVar(value=saved_path)
+        self.steamcmd_var = tk.StringVar(value=self.config.get("steamcmd_path", ""))
+        self.cache_var = tk.StringVar(value=self.config.get("cache_path", os.path.join(self.base_dir, "workshop_cache")))
+        self.workshop_var = tk.StringVar(value="")
+
+        self.mod_id_var = tk.StringVar()
+        self.image_cache = {}
+        # (game_key, mod_id) of the last Workshop item confirmed to belong to
+        # the selected game. Downloads are only allowed for that exact item.
+        self.validated_mod = None
+        self._preview_after_id = None
+        self.metadata_cache = TtlCache(METADATA_TTL_SECONDS)
+        self.metadata_executor = ThreadPoolExecutor(max_workers=MAX_METADATA_FETCHES)
+        self.refresh_generation = 0
+        self.game_install_sources = {}
+        self.game_workshop_dirs = {}
+        self.mod_source_paths = {}
+        self.mod_source_kinds = {}
+        
+        # Threading & Process Control
+        self.stop_event = threading.Event()
+        self.active_processes = []
+        self.task_lock = threading.Lock()
+        self.task_state = TaskState()
+        self.ui_dispatcher = UiDispatcher()
+        self.root.after(UI_POLL_MS, self._drain_ui_queue)
+
+        try:
+            self.ensure_cache_root(self.cache_var.get())
+        except Exception:
+            pass
+
+        self.setup_ui()
+        self.check_admin()
+        
+        # Always resolve metadata for the active install so a saved Steam path
+        # still retains its Steam library / Workshop relationship.
+        self.auto_detect_game()
+        if not self.steamcmd_var.get(): self.auto_detect_steamcmd()
+        self.toggle_ui_mode()
+        self.initialize_engine()
+
+    def shutdown(self):
+        """Stop background work so queued Workshop lookups don't delay exit."""
+        self.refresh_generation += 1
+        self.stop_operation()
+        self.metadata_executor.shutdown(wait=False, cancel_futures=True)
+        self.root.destroy()
+
+    def ui(self, callback):
+        """Run ``callback`` on the Tk main thread. Safe to call from any thread."""
+        self.ui_dispatcher.post(callback)
+
+    def _drain_ui_queue(self):
+        self.ui_dispatcher.drain()
+        self.root.after(UI_POLL_MS, self._drain_ui_queue)
+
+    def load_custom_fonts(self):
+        self.available_fonts = []
+        if not IS_WINDOWS:
+            return  # Font loading not needed on Linux
+        for key, g in self.games.items():
+            font_path = os.path.join(self.resource_dir, g["font_file"])
+            if os.path.exists(font_path):
+                try: 
+                    # Check return value: > 0 means success
+                    if ctypes.windll.gdi32.AddFontResourceExW(font_path, 0x10, 0) > 0:
+                        self.available_fonts.append(g["font_name"])
+                except Exception: pass
+
+    def load_game_icons(self):
+        self.game_icons = {}
+        if not HAS_PIL: return
+        for key, g in self.games.items():
+            try:
+                p = os.path.join(self.resource_dir, g["icon_file"])
+                if os.path.exists(p):
+                    img = Image.open(p).resize((48, 48), Image.Resampling.LANCZOS)
+                    self.game_icons[key] = ImageTk.PhotoImage(img)
+            except Exception: pass
+
+    def apply_theme_vars(self):
+        g = self.games[self.current_game_key]
+        self.colors = g["colors"]
+        # Fallback to Consolas if custom font didn't load
+        self.current_font = g["font_name"] if g["font_name"] in self.available_fonts else "Consolas"
+
+    def get_user_config_dir(self):
+        return util_get_user_config_dir(IS_WINDOWS, IS_LINUX)
+
+    def normalize_path(self, path):
+        return util_normalize_path(path)
+
+    def paths_match(self, left, right):
+        return util_paths_match(left, right)
+
+    def get_steamcmd_name(self):
+        return util_get_steamcmd_name(IS_WINDOWS)
+
+    def get_default_steamcmd_path(self):
+        return util_get_default_steamcmd_path(self.bin_dir, IS_WINDOWS)
+
+    def get_steamcmd_candidates(self):
+        return util_get_steamcmd_candidates(self.bin_dir, IS_WINDOWS, IS_LINUX)
+
+    def get_popen_output_kwargs(self):
+        return util_get_popen_output_kwargs(IS_WINDOWS)
+
+    def open_path(self, target):
+        util_open_path(target, IS_WINDOWS, IS_LINUX)
+
+    def build_game_context(self, game_key=None, game_path=None):
+        resolved_key = game_key or self.current_game_key
+        raw_game_path = game_path if game_path is not None else self.path_var.get()
+        context = util_build_game_context(self.games, resolved_key, raw_game_path)
+        context["install_source"] = self.game_install_sources.get(resolved_key, "")
+        context["workshop_content_dir"] = self.game_workshop_dirs.get(resolved_key, "")
+        return context
+
+    def collect_workshop_mod_sources(self, primary_content_dir, external_content_dirs=None):
+        return util_collect_workshop_mod_sources(primary_content_dir, external_content_dirs)
+
+    def build_content_dir(self, cache_path, appid):
+        return util_build_content_dir(cache_path, appid)
+
+    def build_mod_cache_path(self, cache_path, appid, mid):
+        return util_build_mod_cache_path(cache_path, appid, mid)
+
+    def get_cache_marker_path(self, cache_path):
+        return util_get_cache_marker_path(cache_path, CACHE_MARKER_FILE)
+
+    def ensure_cache_root(self, cache_path):
+        return util_ensure_cache_root(cache_path, CACHE_MARKER_FILE, "Battlezone Mod Engine cache\n")
+
+    def is_safe_cache_root(self, cache_path):
+        return util_is_safe_cache_root(cache_path, CACHE_MARKER_FILE)
+
+    def clear_directory_contents(self, directory, preserve_names=None):
+        util_clear_directory_contents(directory, self.remove_existing_path, preserve_names=preserve_names)
+
+    def fetch_url_text(self, url):
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as response:
+            return response.read().decode("utf-8", errors="replace")
+
+    def fetch_url_bytes(self, url, timeout=HTTP_TIMEOUT):
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=timeout) as response:
+            return response.read()
+
+    def create_directory_link(self, src, dst):
+        util_create_directory_link(src, dst, IS_WINDOWS)
+
+    def deploy_mod(self, mid, src, dst, use_physical):
+        deployed = util_deploy_mod(
+            src,
+            dst,
+            use_physical,
+            self.remove_path_strict,
+            self.create_directory_link,
+            is_link=self.is_junction,
+        )
+        if not deployed and not os.path.exists(src):
+            self.log(f"Mod source missing for {mid}: {src}", "error")
+        return deployed
+
+    def begin_download_batch(self):
+        with self.task_lock:
+            return self.task_state.begin_download_batch()
+
+    def release_download_batch(self):
+        with self.task_lock:
+            self.task_state.release_download_batch()
+
+    def load_config(self):
+        return util_load_config(self.config_path, self.legacy_config_path, self.base_dir)
+
+    def save_config(self, *args):
+        # Update current game path in config before saving
+        self.config[f"path_{self.current_game_key}"] = self.path_var.get()
+        self.config["last_game"] = self.current_game_key
+        self.config["steamcmd_path"] = self.steamcmd_var.get()
+        self.config["cache_path"] = self.cache_var.get()
+        self.config["use_physical"] = self.use_physical_var.get()
+        self.config["advanced_mode"] = self.advanced_mode_var.get()
+
+        util_save_config(self.config_path, self.config_dir, self.base_dir, self.config)
+
+    def setup_ui(self):
+        style = ttk.Style()
+        style.theme_use('default')
+        
+        self.update_styles(style)
+
+        # --- TABS MAIN STRUCTURE ---
+        self.tabs = ttk.Notebook(self.root)
+        self.dl_tab = ttk.Frame(self.tabs)
+        self.manage_tab = ttk.Frame(self.tabs)
+        self.tabs.add(self.dl_tab, text=" DOWNLOADER ")
+        self.tabs.add(self.manage_tab, text=" MANAGE MODS ")
+        self.tabs.pack(fill="both", expand=True)
+        self.tabs.bind("<<NotebookTabChanged>>", self.on_tab_change)
+
+        # ==========================================
+        # TAB 1: DOWNLOADER
+        # ==========================================
+        
+        # System Configuration
+        cfg = ttk.LabelFrame(self.dl_tab, text=" SYSTEM CONFIGURATION ", padding=10)
+        cfg.pack(fill="x", padx=10, pady=5)
+        
+        # Game Switcher Row
+        game_row = ttk.Frame(cfg)
+        game_row.grid(row=0, column=0, columnspan=4, sticky="ew", pady=(0, 10))
+        self.target_game_label = ttk.Label(game_row, text="TARGET GAME:", font=(self.current_font, 12, "bold"))
+        self.target_game_label.pack(side="left")
+        
+        game_names = [g["name"] for g in self.games.values()]
+        self.game_selector = ttk.Combobox(game_row, values=game_names, state="readonly", width=40)
+        
+        target_name = self.games[self.current_game_key]["name"]
+        if target_name in game_names:
+            self.game_selector.current(game_names.index(target_name))
+        else:
+            self.game_selector.current(0)
+            
+        self.game_selector.pack(side="left", padx=10)
+        self.game_selector.bind("<<ComboboxSelected>>", self.switch_game)
+
+        ttk.Checkbutton(game_row, text="Advanced Mode", variable=self.advanced_mode_var, 
+                       command=self.toggle_ui_mode).pack(side="right", padx=10)
+
+        self.icon_label = tk.Label(game_row, bg=self.colors["bg"])
+        self.icon_label.pack(side="left", padx=5)
+        self.update_game_icon()
+
+        # Concise install status. This is the primary configuration surface in Simple Mode.
+        status_row = ttk.Frame(cfg)
+        status_row.grid(row=1, column=0, columnspan=6, sticky="ew", pady=(0, 8))
+        ttk.Label(status_row, text="INSTALL STATUS:", font=(self.current_font, 10, "bold")).pack(side="left")
+        self.install_status_label = ttk.Label(
+            status_row,
+            text="Not Detected",
+            foreground="#ff4444",
+            font=("Consolas", 10, "bold"),
+        )
+        self.install_status_label.pack(side="left", padx=(8, 12))
+        self.simple_detect_btn = ttk.Button(
+            status_row,
+            text="DETECT",
+            width=10,
+            command=lambda: self.auto_detect_game(verbose=True),
+        )
+        self.simple_detect_btn.pack(side="left", padx=(0, 5))
+        self.simple_browse_btn = ttk.Button(
+            status_row,
+            text="BROWSE",
+            width=10,
+            command=self.browse_game,
+        )
+        self.simple_browse_btn.pack(side="left")
+
+        # Path Rows
+        paths = [
+            ("Game Path:", self.path_var, self.browse_game, "path_entry", 
+             "Where the game executable is installed."),
+            ("SteamCMD:", self.steamcmd_var, self.browse_steamcmd, "steamcmd_entry", 
+             "If you have SteamCMD installed, point to it here.\nIf you aren't sure you can leave it default or choose a new location."),
+            ("Mod Cache:", self.cache_var, self.browse_cache, "cache_entry", 
+             "Location where mods are downloaded locally before being linked to the game.")
+        ]
+
+        self.path_ui_elements = []
+        for i, (txt, var, cmd, attr, tip) in enumerate(paths):
+            row_idx = i + 2
+            widgets = {'default_text': txt}
+            
+            l = ttk.Label(cfg, text=txt)
+            l.grid(row=row_idx, column=0, sticky="w")
+            widgets['label'] = l
+            
+            h_lbl = tk.Label(cfg, text="?", width=2, bg="#222", fg=self.colors['accent'], font=("Consolas", 8, "bold"), cursor="hand2")
+            h_lbl.grid(row=row_idx, column=1, padx=(0, 5))
+            ToolTip(h_lbl, tip, bg="#1a1a1a", fg=self.colors['accent'])
+            widgets['help'] = h_lbl
+            
+            ent = ttk.Entry(cfg, textvariable=var)
+            ent.grid(row=row_idx, column=2, sticky="ew", padx=5)
+            setattr(self, attr, ent) 
+            widgets['entry'] = ent
+            
+            b = ttk.Button(cfg, text="BROWSE", width=10, command=cmd)
+            b.grid(row=row_idx, column=3, pady=2)
+            widgets['browse'] = b
+            
+            extras = []
+            if "Cache" in txt:
+                extras.append(ttk.Button(cfg, text="OPEN", width=8, command=lambda v=var: self.open_generic_folder(v)))
+                extras.append(ttk.Button(cfg, text="CLEAR", width=8, command=self.clear_cache))
+            elif "Game" in txt:
+                extras.append(ttk.Button(cfg, text="DETECT", width=8, command=lambda: self.auto_detect_game(verbose=True)))
+                extras.append(ttk.Button(cfg, text="OPEN", width=8, command=lambda v=var: self.open_generic_folder(v)))
+            elif "Steam" in txt:
+                extras.append(ttk.Button(cfg, text="DETECT", width=8, command=lambda: self.auto_detect_steamcmd(verbose=True)))
+                extras.append(ttk.Button(cfg, text="OPEN", width=8, command=lambda v=var: self.open_generic_folder(v)))
+            
+            for idx, btn in enumerate(extras):
+                btn.grid(row=row_idx, column=4 + idx, pady=2, padx=(0, 5))
+            
+            widgets['extras'] = extras
+            self.path_ui_elements.append(widgets)
+
+        # Detected native Steam Workshop source (read-only, Advanced Mode only).
+        workshop_row_idx = len(paths) + 2
+        workshop_widgets = {'default_text': "Steam Workshop:"}
+        workshop_label = ttk.Label(cfg, text="Steam Workshop:")
+        workshop_label.grid(row=workshop_row_idx, column=0, sticky="w")
+        workshop_widgets['label'] = workshop_label
+
+        workshop_help = tk.Label(
+            cfg,
+            text="?",
+            width=2,
+            bg="#222",
+            fg=self.colors['accent'],
+            font=("Consolas", 8, "bold"),
+            cursor="hand2",
+        )
+        workshop_help.grid(row=workshop_row_idx, column=1, padx=(0, 5))
+        ToolTip(
+            workshop_help,
+            "Detected native Steam Workshop content for this game.\n"
+            "This location is read-only to Mod Engine and is never cleared or deleted.",
+            bg="#1a1a1a",
+            fg=self.colors['accent'],
+        )
+        workshop_widgets['help'] = workshop_help
+
+        self.workshop_entry = ttk.Entry(cfg, textvariable=self.workshop_var, state="readonly")
+        self.workshop_entry.grid(row=workshop_row_idx, column=2, sticky="ew", padx=5)
+        workshop_widgets['entry'] = self.workshop_entry
+        workshop_widgets['browse'] = None
+
+        self.workshop_open_btn = ttk.Button(
+            cfg,
+            text="OPEN",
+            width=8,
+            command=lambda: self.open_generic_folder(self.workshop_var),
+            state="disabled",
+        )
+        self.workshop_open_btn.grid(row=workshop_row_idx, column=4, pady=2, padx=(0, 5))
+        workshop_widgets['extras'] = [self.workshop_open_btn]
+        self.path_ui_elements.append(workshop_widgets)
+
+        cfg.columnconfigure(2, weight=1)
+
+        # Mod Queue (Preview & Input)
+        prev = ttk.LabelFrame(self.dl_tab, text=" MOD QUEUE ", padding=10)
+        prev.pack(fill="x", padx=10, pady=5)
+        
+        thumb_container = tk.Frame(prev, bg="#050505", width=150, height=150, 
+                                 highlightthickness=1, highlightbackground=self.colors['dark_highlight'])
+        thumb_container.pack(side="left", padx=10)
+        thumb_container.pack_propagate(False)
+        self.thumb_container = thumb_container # Ref for theme update
+
+        self.thumb_label = tk.Label(thumb_container, bg="#050505")
+        self.thumb_label = tk.Label(thumb_container, bg="#050505", text="ADD MOD\nLINK OR ID", 
+                                  fg=self.colors['accent'], font=(self.current_font, 10, "bold"), wraplength=140)
+        self.thumb_label.pack(expand=True, fill="both")
+        
+        info_frame = ttk.Frame(prev)
+        info_frame.pack(side="left", fill="both", expand=True)
+        
+        self.mod_name_label = ttk.Label(info_frame, text="READY FOR COMMAND", foreground=self.colors['accent'], font=(self.current_font, 11, "bold"))
+        self.mod_name_label.pack(anchor="w", pady=(0, 5))
+        
+        self.mod_url_label = ttk.Label(info_frame, text="MOD URL OR ID:", font=(self.current_font, 8))
+        self.mod_url_label.pack(anchor="w")
+        self.mod_entry = ttk.Entry(info_frame, textvariable=self.mod_id_var)
+        self.mod_entry.pack(fill="x", pady=5)
+        
+        if HAS_DND:
+            self.mod_entry.drop_target_register(DND_TEXT)
+            self.mod_entry.dnd_bind('<<Drop>>', lambda e: self.mod_id_var.set(e.data.strip("{}")))
+            
+            self.thumb_label.drop_target_register(DND_TEXT)
+            self.thumb_label.dnd_bind('<<Drop>>', lambda e: self.mod_id_var.set(e.data.strip("{}")))
+        self.mod_id_var.trace_add("write", self.on_input_change)
+
+        # Context Menu for Inputs
+        self.input_menu = tk.Menu(self.root, tearoff=0, bg="#1a1a1a", fg=self.colors['fg'])
+        self.input_menu.add_command(label="PASTE FROM CLIPBOARD", command=self.paste_from_clipboard)
+        self.thumb_label.bind("<Button-3>", self.show_input_menu)
+        self.mod_entry.bind("<Button-3>", self.show_input_menu)
+
+        btn_row = ttk.Frame(info_frame)
+        btn_row.pack(fill="x", pady=5)
+        self.dl_btn = ttk.Button(btn_row, text="INSTALL MOD", command=self.start_download, style="Success.TButton")
+        self.dl_btn.pack(side="left", padx=(0, 5))
+        self.launch_btn = ttk.Button(btn_row, text="LAUNCH GAME", command=self.launch_game)
+        self.launch_btn.pack(side="left")
+        self.workshop_btn = ttk.Button(btn_row, text="WORKSHOP", command=self.open_workshop)
+        self.workshop_btn.pack(side="left", padx=5)
+        self.stop_btn = ttk.Button(btn_row, text="STOP", command=self.stop_operation, state="disabled")
+        self.stop_btn.pack(side="left", padx=5)
+
+        # HUD Log
+        log_header = ttk.Frame(self.dl_tab)
+        log_header.pack(fill="x", padx=10, pady=(5, 0))
+        
+        self.hud_log_label = ttk.Label(log_header, text=" HUD LOG ", foreground=self.colors['highlight'], font=(self.current_font, 11, "bold"))
+        self.hud_log_label.pack(side="left")
+        ttk.Button(log_header, text="CLEAR", width=8, command=self.clear_hud_log).pack(side="right")
+        
+        self.log_box = tk.Text(self.dl_tab, state="disabled", font=("Consolas", 10), bg="#050505", fg=self.colors['fg'], height=12)
+        self.log_box.pack(fill="both", expand=True, padx=10, pady=5)
+        
+        # Log tags
+        self.log_box.tag_config("timestamp", foreground="#444444")
+        self.log_box.tag_config("success", foreground=self.colors['highlight'])
+        self.log_box.tag_config("warning", foreground="#ffff44")
+        self.log_box.tag_config("error", foreground="#ff4444")
+        self.log_box.tag_config("info", foreground=self.colors['accent'])
+
+        self.progress = ttk.Progressbar(self.dl_tab, style="BZ.Horizontal.TProgressbar", mode="determinate")
+        self.progress.pack(fill="x", padx=10, pady=10)
+        
+        self.progress_label = tk.Label(self.dl_tab, text="IDLE", bg="#050505", fg="#666666", font=("Consolas", 8))
+        self.progress_label.place(in_=self.progress, relx=0.5, rely=0.5, anchor="center")
+
+        # ==========================================
+        # TAB 2: MANAGE MODS
+        # ==========================================
+        
+        self.tree = ttk.Treeview(self.manage_tab, columns=("Name", "ID", "Status", "Version", "Date"), show="tree headings")
+        self.tree.column("#0", width=45, anchor="center", stretch=False)
+        self.tree.heading("#0", text="")
+        for col in ["Name", "ID", "Status", "Version", "Date"]: 
+            self.tree.heading(col, text=col.upper(), command=lambda c=col: self.sort_tree(c, False))
+            self.tree.column(col, anchor="center", width=100)
+        self.tree.column("Name", width=250) 
+        
+        self.tree.pack(fill="both", expand=True, padx=10, pady=10)
+        self.tree.bind("<Button-3>", self.show_mod_menu)
+        self.tree.bind("<ButtonPress-1>", self.on_tree_press)
+        self.tree.bind("<B1-Motion>", self.on_tree_motion)
+        manage_ctrl = ttk.Frame(self.manage_tab)
+        manage_ctrl.pack(fill="x", padx=10, pady=5)
+        
+        ttk.Button(manage_ctrl, text="CHECK FOR UPDATES", command=self.refresh_list).pack(side="left")
+        ttk.Button(manage_ctrl, text="SELECT ALL", command=self.select_all_mods).pack(side="left", padx=5)
+        
+        self.manage_help_lbl = tk.Label(manage_ctrl, text="?", width=2, bg="#222", fg=self.colors['accent'], font=("Consolas", 8, "bold"), cursor="hand2")
+        self.manage_help_lbl.pack(side="left", padx=10)
+        self.manage_help_tip = ToolTip(self.manage_help_lbl, "CONTROLS:\n• Double-Click: Toggle Enable/Disable\n• Right-Click: Context Menu\n• Drag/Shift+Click: Multi-Select", bg="#1a1a1a", fg=self.colors['accent'])
+
+        ttk.Button(manage_ctrl, text="UPDATE ALL", command=self.update_all_mods).pack(side="right")
+
+        # Context Menu
+        self.mod_menu = tk.Menu(self.root, tearoff=0, bg="#1a1a1a", fg=self.colors['fg'])
+        self.mod_menu.add_command(label="ENABLE (LINK)", command=self.enable_mod)
+        self.mod_menu.add_command(label="DISABLE (UNLINK)", command=self.disable_mod)
+        self.mod_menu.add_separator()
+        self.mod_menu.add_command(label="UPDATE MOD", command=lambda: self.update_selected_mod(force=False))
+        self.mod_menu.add_command(label="FORCE UPDATE", command=lambda: self.update_selected_mod(force=True))
+        self.mod_menu.add_command(label="DELETE FROM DISK", command=self.delete_mod_physically)
+
+        self.update_tree_tags()
+
+    def toggle_ui_mode(self):
+        advanced = self.advanced_mode_var.get()
+
+        # Simple Mode presents status, not raw filesystem plumbing.
+        self.set_row_visibility(0, show_row=advanced, simple=False)  # Game Path
+        self.set_row_visibility(1, show_row=advanced, simple=False)  # SteamCMD
+        self.set_row_visibility(2, show_row=advanced, simple=False)  # Mod Engine Cache
+        self.set_row_visibility(3, show_row=advanced, simple=False)  # Native Steam Workshop
+
+        cache_widgets = self.path_ui_elements[2]
+        cache_widgets['label'].config(text=cache_widgets['default_text'])
+
+        if not advanced:
+            self.simple_detect_btn.pack(side="left", padx=(0, 5))
+            self.simple_browse_btn.pack(side="left")
+            self.thumb_label.config(text="DRAG MOD LINK HERE\nOR COPY/PASTE")
+            self.mod_url_label.config(text="PASTE WORKSHOP LINK HERE:")
+        else:
+            self.simple_detect_btn.pack_forget()
+            self.simple_browse_btn.pack_forget()
+            self.thumb_label.config(text="ADD MOD\nLINK OR ID")
+            self.mod_url_label.config(text="MOD URL OR ID:")
+
+        if not advanced:
+            self.workshop_btn.pack_forget()
+            self.launch_btn.pack_forget()
+            self.stop_btn.pack_forget()
+        else:
+            for btn in [self.dl_btn, self.launch_btn, self.workshop_btn, self.stop_btn]:
+                btn.pack_forget()
+            self.dl_btn.pack(side="left", padx=(0, 5))
+            self.launch_btn.pack(side="left")
+            self.workshop_btn.pack(side="left", padx=5)
+            self.stop_btn.pack(side="left", padx=5)
+
+        self.update_install_ui()
+
+    def set_row_visibility(self, index, show_row, simple):
+        widgets = self.path_ui_elements[index]
+        browse = widgets.get('browse')
+        if show_row:
+            widgets['label'].grid()
+            widgets['entry'].grid()
+            if browse is not None:
+                browse.grid()
+
+            if simple:
+                widgets['help'].grid_remove()
+                for w in widgets['extras']:
+                    w.grid_remove()
+            else:
+                widgets['help'].grid()
+                for w in widgets['extras']:
+                    w.grid()
+        else:
+            widgets['label'].grid_remove()
+            widgets['entry'].grid_remove()
+            if browse is not None:
+                browse.grid_remove()
+            widgets['help'].grid_remove()
+            for w in widgets['extras']:
+                w.grid_remove()
+
+    def update_styles(self, style):
+        main_font = (self.current_font, 10)
+        bold_font = (self.current_font, 11, "bold")
+        c = self.colors
+
+        # --- GLOBAL STYLES ---
+        style.configure(".", background=c["bg"], foreground=c["fg"], font=main_font, bordercolor=c["dark_highlight"])
+        style.configure("TFrame", background=c["bg"])
+        style.configure("TNotebook", background=c["bg"], borderwidth=0)
+        style.configure("TNotebook.Tab", background="#1a1a1a", foreground=c["fg"], padding=[10, 2])
+        style.map("TNotebook.Tab", background=[("selected", c["dark_highlight"])], foreground=[("selected", c["highlight"])])
+        style.configure("TLabelframe", background=c["bg"], bordercolor=c["highlight"])
+        style.configure("TLabelframe.Label", background=c["bg"], foreground=c["highlight"], font=bold_font)
+        style.configure("TLabel", background=c["bg"], foreground=c["fg"])
+        style.configure("TEntry", fieldbackground="#1a1a1a", foreground=c["accent"], insertcolor=c["highlight"])
+        style.configure("BZ.Horizontal.TProgressbar", thickness=15, background=c["highlight"], troughcolor="#050505")
+        style.configure("TButton", background="#1a1a1a", foreground=c["fg"])
+        style.map("TButton", background=[("active", c["dark_highlight"])], foreground=[("active", c["highlight"])])
+        style.configure("Success.TButton", foreground=c["highlight"], font=bold_font)
+        
+        style.configure("Treeview", background="#0a0a0a", foreground=c["fg"], fieldbackground="#0a0a0a", rowheight=40)
+        style.map("Treeview", background=[("selected", c["accent"])], foreground=[("selected", "#000000")])
+
+    def update_game_icon(self):
+        if not hasattr(self, 'icon_label'): return
+        c = self.colors
+        icon = self.game_icons.get(self.current_game_key)
+        
+        if icon:
+            self.icon_label.config(image=icon, bg=c["bg"], highlightbackground=c["highlight"], highlightthickness=1, bd=0)
+            self.icon_label.image = icon
+        else:
+            self.icon_label.config(image="", width=0, bd=0, highlightthickness=0)
+
+    def update_tree_tags(self):
+        c = self.colors
+        self.tree.tag_configure('active', foreground=c['highlight'])
+        self.tree.tag_configure('inactive', foreground="#666666")
+
+    def switch_game(self, event=None):
+        if self.task_state.has_active_tasks:
+            self.game_selector.set(self.games[self.current_game_key]["name"])
+            self.log("Wait for the current operation to finish before switching games.", "warning")
+            return
+
+        selected_name = self.game_selector.get()
+        
+        # Find key by name
+        new_key = next((k for k, v in self.games.items() if v["name"] == selected_name), "BZ98R")
+        
+        if new_key == self.current_game_key: return
+        
+        # Save current state
+        self.save_config()
+        
+        # Switch
+        self.current_game_key = new_key
+        self.apply_theme_vars()
+        
+        # Update Path Var
+        saved_path = self.config.get(f"path_{self.current_game_key}", "")
+        self.path_var.set(saved_path)
+        
+        # Update UI Styles
+        style = ttk.Style()
+        self.update_styles(style)
+        
+        # Update Manual Widgets
+        c = self.colors
+        self.root.configure(bg=c["bg"])
+        self.log_box.configure(fg=c["fg"])
+        self.log_box.tag_config("success", foreground=c['highlight'])
+        self.log_box.tag_config("info", foreground=c['accent'])
+        
+        self.mod_name_label.configure(foreground=c['accent'], font=(self.current_font, 11, "bold"))
+        self.hud_log_label.configure(foreground=c['highlight'], font=(self.current_font, 11, "bold"))
+        self.thumb_label.configure(fg=c['accent'], font=(self.current_font, 10, "bold"))
+        self.target_game_label.configure(font=(self.current_font, 12, "bold"))
+        self.mod_url_label.configure(font=(self.current_font, 8))
+        self.thumb_container.configure(highlightbackground=c['dark_highlight'])
+        self.mod_menu.configure(fg=c['fg'])
+        self.input_menu.configure(fg=c['fg'])
+        
+        if hasattr(self, 'manage_help_lbl'):
+            self.manage_help_lbl.configure(fg=c['accent'])
+            self.manage_help_tip.fg = c['accent']
+        
+        self.update_tree_tags()
+        self.update_game_icon()
+        
+        self.log(f"Switched to {self.games[new_key]['name']}", "info")
+        self.auto_detect_game()
+        self.initialize_engine()
+        self.refresh_list()
+        self.save_config()
+        
+        if self.mod_id_var.get():
+            self.on_input_change()
+
+    def clear_hud_log(self):
+        self.log_box.config(state="normal")
+        self.log_box.delete("1.0", "end")
+        self.log_box.config(state="disabled")
+
+    def log(self, message, tag=None):
+        self.ui(lambda: self._log_impl(message, tag))
+
+    def _log_impl(self, message, tag=None):
+        # Simple Mode Filter: Only show tagged messages (Success, Warning, Error, Info)
+        if not self.advanced_mode_var.get() and tag is None:
+            return
+
+        self.log_box.config(state="normal")
+        ts = datetime.now().strftime("[%H:%M:%S] ")
+        self.log_box.insert("end", ts, "timestamp")
+        
+        if tag:
+            self.log_box.insert("end", f"{message}\n", tag)
+        else:
+            self.log_box.insert("end", f"{message}\n")
+            
+        self.log_box.see("end")
+        self.log_box.config(state="disabled")
+
+    def start_task(self):
+        with self.task_lock:
+            transition = self.task_state.start_task()
+            if transition.entered_busy:
+                self.stop_event.clear()
+                self.ui(lambda: self.stop_btn.config(state="normal"))
+                self.ui(lambda: self.game_selector.config(state="disabled"))
+
+    def end_task(self, callback=None):
+        with self.task_lock:
+            transition = self.task_state.end_task()
+            if transition.became_idle:
+                self.ui(lambda: self.stop_btn.config(state="disabled"))
+                self.ui(lambda: self.game_selector.config(state="readonly"))
+                self.ui(self.reset_progress)
+                if callback:
+                    self.ui(lambda: self.root.after(1000, callback))
+
+    def stop_operation(self):
+        self.stop_event.set()
+        self.log("Stopping operations...", "warning")
+        for p in list(self.active_processes):
+            try: terminate_process_tree(p, IS_WINDOWS)
+            except Exception: pass
+
+    def get_dependencies(self, mid):
+        """Scrapes the Steam Workshop page for required items."""
+        url = f"https://steamcommunity.com/sharedfiles/filedetails/?id={mid}&l=english"
+        try:
+            html = self.fetch_url_text(url)
+            return extract_required_item_ids(html)
+        except Exception as e:
+            self.log(f"Dependency Check Failed: {e}", "warning")
+            pass
+        return []
+
+    def update_batch_progress(self, item_percent, completed_count, total_items):
+        progress_state = calculate_batch_progress(item_percent, completed_count, total_items)
+        self.progress.stop()
+        self.progress.config(mode="determinate", value=progress_state["total_percent"])
+        self.progress_label.config(text=progress_state["label_text"])
+        if progress_state["button_text"]:
+            self.dl_btn.config(text=progress_state["button_text"])
+
+    def _abort_download_ui(self):
+        self.release_download_batch()
+        self.dl_btn.config(text="INSTALL MOD", state="normal")
+        self.reset_progress()
+        self.end_task()
+
+    def _prompt_deps_and_start(self, queue, deps, sc_path, cache_path, game_context):
+        try:
+            if deps:
+                if messagebox.askyesno("Dependencies Found", f"This mod requires {len(deps)} other items.\nDownload them as well?"):
+                    queue.extend(deps)
+        except Exception as e:
+            self.log(f"Dependency prompt failed: {e}", "warning")
+
+        use_physical = self.resolve_deploy_mode(game_context["game_path"], self.use_physical_var.get())
+        if use_physical is None:
+            self._abort_download_ui()
+            return
+
+        self.dl_btn.config(state="disabled", text="ENGINE ACTIVE")
+        self.progress.config(mode="indeterminate")
+        self.progress.start(10)
+        self.progress_label.config(text="INITIALIZING...", fg=self.colors['accent'])
+
+        threading.Thread(
+            target=self.download_logic,
+            args=(queue, sc_path, cache_path, game_context, use_physical),
+            daemon=True
+        ).start()
+
+    def start_download(self):
+        mid = self.sanitize_id(self.mod_id_var.get())
+        if not mid: 
+            self.dl_btn.config(text="NO MOD ID")
+            self.root.after(2000, lambda: self.dl_btn.config(text="INSTALL MOD", state="normal"))
+            return
+        
+        # FINAL GATEKEEPER: only the exact item that was confirmed for this game.
+        if self.validated_mod != (self.current_game_key, mid):
+            current_game_name = self.games[self.current_game_key]["name"]
+            messagebox.showerror(
+                "Validation Error",
+                f"Mod ID {mid} has not been verified as a {current_game_name} Workshop item.\n"
+                "Wait for the preview to load, or check the ID and your connection.\nDownload Aborted.",
+            )
+            return
+
+        if not self.begin_download_batch():
+            self.log("A download or update batch is already running.", "warning")
+            return
+
+        queue = [mid]
+        game_context = self.build_game_context()
+        sc_path = self.steamcmd_var.get()
+        cache_path = self.cache_var.get()
+        self.dl_btn.config(state="disabled", text="CHECKING DEPS...")
+        self.progress.config(mode="indeterminate")
+        self.progress.start(10)
+        self.progress_label.config(text="CHECKING DEPS...", fg=self.colors['accent'])
+        self.start_task()
+
+        def deps_worker():
+            deps = []
+            try:
+                deps = self.get_dependencies(mid)
+            except Exception as e:
+                self.log(f"Dependency Check Failed: {e}", "warning")
+            self.ui(lambda: self._prompt_deps_and_start(queue, deps, sc_path, cache_path, game_context))
+
+        threading.Thread(target=deps_worker, daemon=True).start()
+
+    def download_logic(self, mod_ids, sc_path, cache_path, game_context, use_physical):
+        if isinstance(mod_ids, str):
+            mod_ids = [mod_ids]
+        final_button_text = "FAILED"
+        try:
+            current_appid = game_context["appid"]
+            game_path = game_context["game_path"]
+            final_sc_path = self.ensure_steamcmd(sc_path)
+            cache = self.ensure_cache_root(cache_path)
+
+            if ensure_console_language_file(final_sc_path) is None:
+                self.log("Could not write SteamConsole.txt next to SteamCMD; continuing without it.")
+
+            total_items = len(mod_ids)
+            self.log(f"Batch processing {total_items} items...", "info")
+
+            for mid, exists_locally in classify_workshop_items(cache, current_appid, mod_ids, self.build_mod_cache_path):
+                if exists_locally:
+                    self.log(f"Queueing update: {mid}", "warning")
+                else:
+                    self.log(f"Queueing download: {mid}", "info")
+
+            cmd = build_workshop_download_command(final_sc_path, cache, current_appid, mod_ids)
+
+            p = subprocess.Popen(cmd, **self.get_popen_output_kwargs())
+            self.active_processes.append(p)
+
+            completed_count = 0
+            succeeded = set()
+            last_log_time = 0
+
+            try:
+                while True:
+                    if self.stop_event.is_set():
+                        terminate_process_tree(p, IS_WINDOWS)
+                        break
+                    line = p.stdout.readline()
+                    if not line:
+                        break
+
+                    event = parse_steamcmd_output_line(line)
+                    current_time = datetime.now().timestamp()
+
+                    if event["kind"] == "empty":
+                        continue
+                    if event["kind"] == "success":
+                        completed_count += 1
+                        succeeded.add(event["item"])
+                        self.log(f"Success: {event['item']} ({completed_count}/{total_items})", "success")
+                        self.ui(lambda c=completed_count, t=total_items: self.update_batch_progress(0, c, t))
+                    elif event["kind"] == "error":
+                        self.log(event["message"], "error")
+                    elif event["kind"] == "progress":
+                        self.ui(lambda v=event["value"], c=completed_count, t=total_items: self.update_batch_progress(v, c, t))
+                    elif event["kind"] == "verifying":
+                        self.ui(lambda c=completed_count, t=total_items: self.dl_btn.config(text=f"VERIFYING {c+1}/{t}..."))
+                    elif event["kind"] == "noisy":
+                        if should_log_noisy_line(current_time, last_log_time):
+                            self.log(event["message"])
+                            last_log_time = current_time
+                    elif event["kind"] == "info":
+                        self.log(event["message"])
+
+                try:
+                    p.wait(timeout=30)
+                except subprocess.TimeoutExpired:
+                    p.kill()
+                    p.wait()
+            finally:
+                if p in self.active_processes:
+                    self.active_processes.remove(p)
+
+            if self.stop_event.is_set():
+                # Items may be half-downloaded; deploying them (especially in
+                # Physical Copy mode, which replaces the game's copy) would break
+                # working installs.
+                self.log("Download cancelled. No mods were deployed from this batch.", "warning")
+                final_button_text = "CANCELLED"
+                return
+
+            if p.returncode not in (0, None):
+                self.log(f"SteamCMD exited with code {p.returncode}.", "warning")
+
+            outcome = summarize_download_batch(
+                mod_ids,
+                succeeded,
+                lambda mid: os.path.exists(self.build_mod_cache_path(cache, current_appid, mid)),
+            )
+            for mid in outcome["stale"]:
+                self.log(f"Update failed for {mid}; keeping the previously downloaded version.", "warning")
+            for mid in outcome["missing"]:
+                self.log(f"Download failed for {mid}: SteamCMD did not produce the item.", "error")
+
+            deploy_failures = 0
+            for mid in outcome["downloaded"] + outcome["stale"]:
+                src = os.path.normpath(self.build_mod_cache_path(cache, current_appid, mid))
+                dst = os.path.normpath(os.path.join(game_path, "mods", mid))
+
+                deployed_ok = False
+                try:
+                    deployed_ok = self.deploy_mod(mid, src, dst, use_physical)
+                except Exception as e:
+                    self.log(f"Link creation failed for {mid}: {e}", "error")
+                if deployed_ok:
+                    self.log(f"Deployment complete: {mid}", "success")
+                else:
+                    deploy_failures += 1
+                    self.log(f"Deployment failed: {mid}", "error")
+
+            for mid in outcome["downloaded"]:
+                self.metadata_cache.discard(mid)
+            final_button_text = outcome["status"]
+            if deploy_failures:
+                final_button_text = "FAILED" if deploy_failures == total_items else "PARTIAL"
+
+        except Exception as e:
+            self.log(f"CRITICAL: {e}", "error")
+        finally:
+            self.ui(lambda text=final_button_text: self.dl_btn.config(text=text))
+            self.ui(lambda: self.root.after(3000, lambda: self.dl_btn.config(text="INSTALL MOD", state="normal")))
+            self.release_download_batch()
+            self.end_task(self.refresh_list if not self.stop_event.is_set() else None)
+
+    def reset_progress(self):
+        self.progress.stop()
+        self.progress.config(mode="determinate", value=0)
+        self.progress_label.config(text="IDLE", fg="#666666")
+
+    def on_input_change(self, *args):
+        # Any edit invalidates the previous verdict until the new ID is checked.
+        self.validated_mod = None
+        mid = self.sanitize_id(self.mod_id_var.get())
+        if self._preview_after_id is not None:
+            self.root.after_cancel(self._preview_after_id)
+            self._preview_after_id = None
+        if mid:
+            self.mod_name_label.config(text="VALIDATING...", foreground=self.colors['fg'])
+            # Debounce so typing an ID does not send one Steam request per keystroke.
+            self._preview_after_id = self.root.after(PREVIEW_DEBOUNCE_MS, lambda: self._start_preview_fetch(mid))
+
+    def _start_preview_fetch(self, mid):
+        self._preview_after_id = None
+        if self.sanitize_id(self.mod_id_var.get()) != mid:
+            return
+        game_context = self.build_game_context()
+        threading.Thread(target=self.fetch_preview, args=(mid, game_context), daemon=True).start()
+
+    def open_workshop(self):
+        appid = self.games[self.current_game_key]["appid"]
+        webbrowser.open(f"https://steamcommunity.com/app/{appid}/workshop/")
+
+    def fetch_preview(self, mid, game_context):
+        """Worker thread: fetch Workshop metadata; all UI/state updates go via self.ui."""
+        game_key = game_context["key"]
+        try:
+            url = f"https://steamcommunity.com/sharedfiles/filedetails/?id={mid}&l=english"
+            html = self.fetch_url_text(url)
+            metadata = parse_workshop_metadata(html)
+        except Exception as e:
+            self.log(f"Metadata Fetch Error: {e}", "error")
+            self.ui(lambda: self.update_preview_title(game_key, mid, "VALIDATION FAILED", "#ff4444"))
+            return
+
+        verdict = classify_workshop_app(metadata, game_context["appid"])
+        if verdict == "wrong_game":
+            self.ui(lambda: self.update_preview_title(game_key, mid, "INVALID GAME DETECTED", "#ff0000"))
+            return
+        if verdict == "unknown":
+            self.ui(lambda: self.update_preview_title(game_key, mid, "ITEM NOT FOUND", "#ff4444"))
+            return
+
+        title = metadata.title or f"ID: {mid}"
+        self.ui(lambda: self.mark_mod_validated(game_key, mid, title))
+
+        if HAS_PIL and metadata.thumbnail_url:
+            try:
+                raw = self.fetch_url_bytes(metadata.thumbnail_url)
+                img = Image.open(BytesIO(raw)).resize((150, 150), Image.Resampling.LANCZOS)
+                img.load()
+            except Exception as e:
+                self.log(f"Preview image error: {e}")
+                return
+            self.ui(lambda: self.update_preview_image(game_key, mid, img))
+
+    def mark_mod_validated(self, game_key, mid, title):
+        if not self.is_active_preview_request(game_key, mid):
+            return
+        self.validated_mod = (game_key, mid)
+        self.mod_name_label.config(text=title, foreground=self.colors['accent'])
+
+    def is_active_preview_request(self, game_key, mid):
+        return game_key == self.current_game_key and self.sanitize_id(self.mod_id_var.get()) == mid
+
+    def update_preview_title(self, game_key, mid, title, color):
+        if not self.is_active_preview_request(game_key, mid):
+            return
+        self.mod_name_label.config(text=title, foreground=color)
+
+    def update_preview_image(self, game_key, mid, image):
+        if not self.is_active_preview_request(game_key, mid):
+            return
+        # PhotoImage is a Tk object, so it is created here on the main thread.
+        self.update_thumb(ImageTk.PhotoImage(image))
+
+    def update_thumb(self, photo):
+        self.thumb_label.config(image=photo)
+        self.thumb_label.image = photo 
+
+    def show_input_menu(self, event):
+        self.input_menu.post(event.x_root, event.y_root)
+
+    def paste_from_clipboard(self):
+        try:
+            self.mod_id_var.set(self.root.clipboard_get())
+        except Exception: pass
+
+    def sanitize_id(self, input_str):
+        match = re.search(r'id=(\d+)', input_str)
+        return match.group(1) if match else (input_str.strip() if input_str.strip().isdigit() else None)
+
+    def initialize_engine(self):
+        game_name = self.games[self.current_game_key]["name"]
+        self.log(f"{game_name} Engine Initializing...", "info")
+        
+        # Check Game Path - Logic adjusted for your test environment
+        game_exe = os.path.join(self.path_var.get(), self.games[self.current_game_key]["exe"])
+        if not os.path.exists(game_exe):
+            self.log("NOTICE: Executable not found. Running in Virtual/Test mode.", "warning")
+            self.path_entry.configure(foreground="#ffff44") # Yellow for "Mock Mode"
+        else:
+            self.log(f"System Link Established: {game_exe}", "success")
+            self.path_entry.configure(foreground=self.colors['accent'])
+        
+        # Check SteamCMD
+        if not os.path.exists(self.steamcmd_var.get()):
+            self.log("WARNING: SteamCMD missing. Downloads disabled.", "warning")
+            self.steamcmd_entry.configure(foreground="#ffff44")
+        else:
+            self.log("SteamCMD Binary: Verified.", "success")
+
+        self.log("Ready for mod deployment.", "info")
+
+    def ensure_steamcmd(self, target):
+        if not target:
+            target = self.get_default_steamcmd_path()
+            self.ui(lambda: self.steamcmd_var.set(target))
+            
+        if not os.path.exists(target):
+            if not IS_WINDOWS:
+                raise FileNotFoundError("SteamCMD was not found. Install steamcmd and point the app to the executable.")
+
+            target_dir = os.path.dirname(target)
+            self.log(f"SteamCMD missing. Downloading to {target_dir}...", "warning")
+            os.makedirs(target_dir, exist_ok=True)
+            zip_p = os.path.join(target_dir, "sc.zip")
+            try:
+                with open(zip_p, "wb") as handle:
+                    handle.write(self.fetch_url_bytes(STEAMCMD_URL, timeout=120))
+                with zipfile.ZipFile(zip_p, 'r') as z:
+                    safe_extract_zip(z, target_dir)
+                os.remove(zip_p)
+                self.log("SteamCMD installed successfully.", "success")
+            except Exception as e:
+                self.log(f"SteamCMD Setup Error: {e}", "error")
+                raise e
+        return target
+
+    def check_admin(self):
+        if IS_WINDOWS and ctypes:
+            if not ctypes.windll.shell32.IsUserAnAdmin():
+                self.log("NOTICE: Non-Admin mode detected.", "error")
+                self.show_admin_warning()
+        # Linux doesn't need admin for symlinks
+
+    def show_admin_warning(self):
+        self.admin_frame = tk.Frame(self.dl_tab, bg="#330000", pady=2)
+        children = self.dl_tab.winfo_children()
+        if children:
+            self.admin_frame.pack(side="top", fill="x", padx=10, pady=(5,0), before=children[0])
+        else:
+            self.admin_frame.pack(side="top", fill="x", padx=10, pady=5)
+            
+        lbl = tk.Label(self.admin_frame, text="⚠ ADMIN OR NTFS REQUIRED FOR JUNCTIONS", 
+                       bg="#330000", fg="#ff5555", font=("Consolas", 10, "bold"))
+        lbl.pack(side="left", padx=10)
+        
+        btn = ttk.Button(self.admin_frame, text="RELAUNCH AS ADMIN", command=self.relaunch_admin)
+        btn.pack(side="right", padx=5, pady=2)
+        ToolTip(lbl, "Windows requires NTFS to create junctions.\nIf your game is on exFAT, use Physical Copy or move to NTFS.")
+
+    def relaunch_admin(self):
+        try:
+            if getattr(sys, 'frozen', False):
+                ctypes.windll.shell32.ShellExecuteW(None, "runas", sys.executable, "", None, 1)
+            else:
+                ctypes.windll.shell32.ShellExecuteW(None, "runas", sys.executable, f'"{os.path.abspath(sys.argv[0])}"', None, 1)
+            self.root.destroy()
+        except Exception as e:
+            self.log(f"Relaunch failed: {e}", "error")
+
+    def browse_game(self): 
+        p = filedialog.askdirectory()
+        if p:
+            new_path = os.path.normpath(p)
+            cache_path = self.cache_var.get()
+            
+            if is_same_or_nested_path(cache_path, new_path):
+                messagebox.showerror(
+                    "Path Conflict",
+                    "Game Path cannot be the Mod Cache folder or inside it.\nPlease select a different folder.",
+                )
+                return
+
+            self.path_var.set(new_path)
+            self.path_entry.configure(foreground=self.colors['accent']) # Reset color
+            if self.is_valid_game_install(new_path):
+                self.auto_detect_game()
+            else:
+                self.game_install_sources[self.current_game_key] = "configured"
+                self.game_workshop_dirs[self.current_game_key] = ""
+                self.save_config()
+                self.update_install_ui()
+            self.log(f"Game path updated: {p}", "success")
+
+    def browse_steamcmd(self): 
+        if IS_WINDOWS:
+            result = messagebox.askyesnocancel(
+                "SteamCMD Setup",
+                "Do you already have SteamCMD installed?\n\nYES: Browse for existing steamcmd.exe\nNO: Select a folder to download a new copy\nCANCEL: Abort"
+            )
+            if result is None:
+                return
+            if result:
+                p = filedialog.askopenfilename(filetypes=[("Executable", "steamcmd.exe"), ("All Executables", "*.exe")])
+                if p:
+                    self.steamcmd_var.set(os.path.normpath(p))
+                    self.steamcmd_entry.configure(foreground=self.colors['accent'])
+                    self.save_config()
+                    self.log(f"SteamCMD path updated: {p}", "success")
+            else:
+                p = filedialog.askdirectory(title="Select Install Location for SteamCMD")
+                if p:
+                    target = os.path.join(p, self.get_steamcmd_name())
+                    self.steamcmd_var.set(os.path.normpath(target))
+                    self.steamcmd_entry.configure(foreground=self.colors['accent'])
+                    self.save_config()
+                    self.log(f"SteamCMD will be installed to: {p}", "info")
+            return
+
+        p = filedialog.askopenfilename(
+            title="Select SteamCMD executable",
+            filetypes=[("SteamCMD", "steamcmd*"), ("All Files", "*.*")]
+        )
+        if p:
+            self.steamcmd_var.set(os.path.normpath(p))
+            self.steamcmd_entry.configure(foreground=self.colors['accent'])
+            self.save_config()
+            self.log(f"SteamCMD path updated: {p}", "success")
+
+    def browse_cache(self): 
+        p = filedialog.askdirectory()
+        if p:
+            new_path = os.path.normpath(p)
+            game_path = self.path_var.get()
+            
+            conflict = self.find_cache_path_conflict(new_path)
+            if conflict:
+                messagebox.showerror("Path Conflict", conflict + "\nPlease select a different folder.")
+                return
+
+            self.ensure_cache_root(new_path)
+            if not self.is_safe_cache_root(new_path):
+                messagebox.showwarning(
+                    "Folder Not Empty",
+                    "This folder already contains other files, so it was not marked as a Mod Engine cache.\n\n"
+                    "Downloads will still work, but CLEAR and mod removal will refuse to delete anything here.\n"
+                    "Choose an empty folder to avoid this.",
+                )
+            self.cache_var.set(new_path)
+            self.save_config()
+            
+            # In Simple Mode, if Game Path is missing, prompt for it now
+            if not self.advanced_mode_var.get():
+                game_path = self.path_var.get()
+                exe_name = self.games[self.current_game_key]["exe"]
+                if not game_path or not os.path.exists(os.path.join(game_path, exe_name)):
+                    messagebox.showinfo("Game Location Required", "Please select your Game Installation folder so mods can be installed.")
+                    self.browse_game()
+
+    def open_generic_folder(self, var):
+        path = var.get()
+        if not path: return
+        target = path
+        if os.path.isfile(target): target = os.path.dirname(target)
+        if os.path.exists(target):
+            self.open_path(target)
+        else: messagebox.showinfo("Info", "Path does not exist.")
+
+    def find_cache_path_conflict(self, cache_path):
+        """Return an error message when clearing ``cache_path`` could delete important folders."""
+        if is_same_or_nested_path(cache_path, self.path_var.get()):
+            return "Mod Cache cannot be the Game folder or a folder containing it."
+        if is_same_or_nested_path(cache_path, self.base_dir):
+            return "Mod Cache cannot be the Mod Engine's own folder or a folder containing it."
+        if is_same_or_nested_path(cache_path, self.bin_dir):
+            return "Mod Cache cannot contain the SteamCMD folder."
+        workshop_dir = self.game_workshop_dirs.get(self.current_game_key, "")
+        if workshop_dir and paths_overlap(cache_path, workshop_dir):
+            return "Mod Cache cannot overlap Steam's own Workshop folder."
+        return None
+
+    def clear_cache(self):
+        cache_path = self.cache_var.get()
+        if not cache_path or not os.path.exists(cache_path):
+            messagebox.showinfo("Cache Empty", "The cache folder does not exist.")
+            return
+
+        cache_root = os.path.abspath(cache_path)
+        # Never create the marker here: it is what authorises this deletion.
+        if not self.is_safe_cache_root(cache_root):
+            messagebox.showerror(
+                "Unsafe Cache Path",
+                "Refusing to clear this folder: it is not marked as a Mod Engine cache "
+                "(it contained other files when it was selected).",
+            )
+            return
+
+        conflict = self.find_cache_path_conflict(cache_root)
+        if conflict:
+            messagebox.showerror("Unsafe Cache Path", f"Refusing to clear the cache.\n{conflict}")
+            return
+
+        # Older versions marked any selected folder, so also refuse folders that
+        # hold anything SteamCMD did not create.
+        unexpected = list_unexpected_cache_entries(cache_root, CACHE_MARKER_FILE)
+        if unexpected is None or unexpected:
+            shown = ", ".join((unexpected or [])[:5]) or "unreadable folder"
+            messagebox.showerror(
+                "Unsafe Cache Path",
+                "Refusing to clear this folder because it contains files the Mod Engine did not create:\n"
+                f"{shown}",
+            )
+            return
+
+        if messagebox.askyesno("Clear Cache", f"Are you sure you want to delete all files in:\n{cache_path}\n\nThis will force re-download of all mods."):
+            try:
+                self.clear_directory_contents(cache_root, preserve_names={CACHE_MARKER_FILE})
+                self.log(
+                    "Mod Engine cache cleared successfully. Steam-managed Workshop content was left untouched.",
+                    "success",
+                )
+                self.refresh_list()
+            except Exception as e:
+                self.log(f"Failed to clear cache: {e}", "error")
+
+
+
+    def launch_game(self):
+        game = self.games[self.current_game_key]
+        exe = os.path.join(self.path_var.get(), game["exe"])
+        if os.path.exists(exe):
+            try:
+                if IS_WINDOWS:
+                    subprocess.Popen([exe], cwd=self.path_var.get())
+                elif self.game_install_sources.get(self.current_game_key) == "steam":
+                    # The game is a Windows build; let Steam start it through Proton.
+                    self.open_path(f"steam://rungameid/{game['appid']}")
+                else:
+                    messagebox.showinfo(
+                        "Launch From Your Launcher",
+                        "This is a Windows game build. Start it from Heroic, Lutris, Wine or "
+                        "whichever launcher you installed it with; enabled mods are picked up automatically.",
+                    )
+                    return
+            except Exception as e:
+                self.log(f"Launch failed: {e}", "error")
+                self.launch_btn.config(text="LAUNCH FAILED")
+                self.root.after(2000, lambda: self.launch_btn.config(text="LAUNCH GAME"))
+                return
+            self.launch_btn.config(text="LAUNCHING...")
+            self.root.after(5000, lambda: self.launch_btn.config(text="LAUNCH GAME"))
+        else:
+            self.launch_btn.config(text="EXE MISSING")
+            self.root.after(2000, lambda: self.launch_btn.config(text="LAUNCH GAME"))
+    def is_valid_game_install(self, path=None, game_key=None):
+        resolved_key = game_key or self.current_game_key
+        candidate = self.path_var.get() if path is None else path
+        return is_valid_game_path(self.games[resolved_key], candidate)
+
+    def update_install_ui(self):
+        if not hasattr(self, "install_status_label"):
+            return
+
+        game_key = self.current_game_key
+        detected = self.is_valid_game_install(game_key=game_key)
+        source = self.game_install_sources.get(game_key, "")
+        status_text = format_install_status(source, detected)
+        status_color = self.colors['highlight'] if detected else "#ff4444"
+        self.install_status_label.configure(text=status_text, foreground=status_color)
+
+        workshop_path = self.game_workshop_dirs.get(game_key, "")
+        if workshop_path:
+            self.workshop_var.set(workshop_path)
+            workshop_state = "normal" if os.path.isdir(workshop_path) else "disabled"
+        else:
+            self.workshop_var.set("Not available for this install")
+            workshop_state = "disabled"
+
+        if hasattr(self, "workshop_open_btn"):
+            self.workshop_open_btn.configure(state=workshop_state)
+
+    def auto_detect_game(self, verbose=False):
+        game_key = self.current_game_key
+        game = self.games[game_key]
+        previous_path = self.path_var.get()
+        result = discover_game_install(
+            game,
+            configured_path=previous_path,
+            is_windows=IS_WINDOWS,
+            is_linux=IS_LINUX,
+            winreg_module=winreg,
+        )
+
+        if result:
+            self.path_var.set(result.path)
+            self.game_install_sources[game_key] = result.source
+            self.game_workshop_dirs[game_key] = result.workshop_content_dir or ""
+            self.save_config()
+            self.update_install_ui()
+
+            source_label = get_install_source_label(result.source)
+            path_changed = not self.paths_match(previous_path, result.path)
+            if result.source != "configured" and (path_changed or verbose):
+                self.log(f"{source_label} installation detected: {result.path}", "success")
+            if result.workshop_content_dir and (path_changed or verbose):
+                self.log(f"Steam Workshop source: {result.workshop_content_dir}", "info")
+            if verbose:
+                messagebox.showinfo("Success", f"Game found via {source_label}:\n{result.path}")
+            return True
+
+        self.game_install_sources[game_key] = ""
+        self.game_workshop_dirs[game_key] = ""
+        self.update_install_ui()
+        if verbose:
+            messagebox.showwarning(
+                "Not Found",
+                "Could not automatically locate this game. Please browse to the installation folder.",
+            )
+        return False
+
+    def auto_detect_steamcmd(self, verbose=False):
+        for p in self.get_steamcmd_candidates():
+            if os.path.exists(p):
+                self.steamcmd_var.set(os.path.normpath(p))
+                self.save_config()
+                if verbose: messagebox.showinfo("Success", f"SteamCMD found at:\n{p}")
+                return
+        if verbose:
+            messagebox.showwarning("Not Found", "Could not locate SteamCMD.\nPlease browse manually.")
+                
+    def on_tab_change(self, event):
+        """Auto-refreshes the list when the user clicks the Manage tab."""
+        if self.tabs.index("current") == 1:
+            self.refresh_list()
+
+    def sort_tree(self, col, reverse):
+        l = [(self.tree.set(k, col), k) for k in self.tree.get_children('')]
+        try:
+            l.sort(key=lambda t: int(t[0]) if t[0].isdigit() else t[0], reverse=reverse)
+        except ValueError:
+            l.sort(reverse=reverse)
+
+        for index, (val, k) in enumerate(l):
+            self.tree.move(k, '', index)
+
+        self.tree.heading(col, command=lambda: self.sort_tree(col, not reverse))
+
+    def on_tree_press(self, event):
+        item = self.tree.identify_row(event.y)
+        if item: self.selection_start = item
+
+    def on_tree_motion(self, event):
+        item = self.tree.identify_row(event.y)
+        if item and hasattr(self, 'selection_start') and self.selection_start:
+            if self.tree.identify_region(event.x, event.y) == "cell":
+                children = self.tree.get_children()
+                try:
+                    start_idx = children.index(self.selection_start)
+                    end_idx = children.index(item)
+                    if start_idx > end_idx: start_idx, end_idx = end_idx, start_idx
+                    self.tree.selection_set(children[start_idx : end_idx + 1])
+                except ValueError: pass
+
+    def show_mod_menu(self, event):
+        item = self.tree.identify_row(event.y)
+        if item:
+            if item not in self.tree.selection():
+                self.tree.selection_set(item)
+            self.mod_menu.post(event.x_root, event.y_root)
+
+    def select_all_mods(self):
+        self.tree.selection_set(self.tree.get_children())
+
+    def refresh_list(self):
+        """Scan the managed SteamCMD cache plus any detected Steam Workshop source."""
+        self.progress_label.config(text="SCANNING...", fg=self.colors['accent'])
+        self.refresh_generation += 1
+        self.progress.config(mode="indeterminate"); self.progress.start(10)
+
+        cache_path = self.cache_var.get()
+        game_context = self.build_game_context()
+
+        self.start_task()
+        threading.Thread(target=self._refresh_scan_logic, args=(cache_path, game_context), daemon=True).start()
+
+    def _refresh_scan_logic(self, cache_path, game_context):
+        try:
+            base_cache = self.ensure_cache_root(cache_path)
+            game_dir = game_context["game_path"]
+
+            if not game_dir:
+                self.log("SCAN FAILED: Game path is not configured.", "error")
+                self.ui(lambda: self._populate_tree([], game_context))
+                return
+
+            current_appid = game_context["appid"]
+            cache_content_dir = self.build_content_dir(base_cache, current_appid)
+            external_dirs = []
+            steam_workshop_dir = game_context.get("workshop_content_dir")
+            if steam_workshop_dir:
+                external_dirs.append(steam_workshop_dir)
+
+            mod_sources = self.collect_workshop_mod_sources(cache_content_dir, external_dirs)
+            game_mods_dir = os.path.join(game_dir, "mods")
+
+            self.log("--- SCANNING FOR ASSETS ---", "info")
+
+            if not os.path.exists(game_mods_dir):
+                try:
+                    os.makedirs(game_mods_dir)
+                except Exception:
+                    pass
+
+            if not mod_sources:
+                locations = [cache_content_dir, *external_dirs]
+                self.log(
+                    "No Workshop content found in: " + " | ".join(locations),
+                    "warning",
+                )
+                self.ui(lambda: self._populate_tree([], game_context))
+                return
+
+            cache_count = sum(1 for value in mod_sources.values() if value["source"] == "cache")
+            steam_count = sum(1 for value in mod_sources.values() if value["source"] == "steam")
+            if steam_count:
+                self.log(
+                    f"Found {cache_count} Mod Engine cached and {steam_count} Steam-managed Workshop item(s).",
+                    "success",
+                )
+            else:
+                self.log(f"Found {cache_count} item(s) in the Mod Engine cache.", "success")
+
+            scan_data = []
+            for mid, source_info in mod_sources.items():
+                if self.stop_event.is_set():
+                    return
+
+                mod_path = source_info["path"]
+                source_kind = source_info["source"]
+                link_path = os.path.join(game_mods_dir, mid)
+
+                is_enabled = os.path.lexists(link_path)
+                status = "ENABLED" if is_enabled else "DISABLED"
+
+                try:
+                    m_time = get_latest_mtime(mod_path)
+                    dt = datetime.fromtimestamp(m_time).strftime('%Y-%m-%d')
+                except Exception:
+                    m_time = 0
+                    dt = "Unknown"
+
+                scan_data.append(
+                    (mid, status, is_enabled, m_time, dt, mod_path, source_kind)
+                )
+
+            self.ui(lambda: self._populate_tree(scan_data, game_context))
+        finally:
+            self.end_task()
+
+    def _populate_tree(self, scan_data, game_context):
+        if game_context["key"] != self.current_game_key:
+            return
+
+        self.tree.delete(*self.tree.get_children())
+        self.mod_source_paths = {}
+        self.mod_source_kinds = {}
+
+        for mid, status, is_enabled, m_time, dt, mod_path, source_kind in scan_data:
+            self.mod_source_paths[mid] = mod_path
+            self.mod_source_kinds[mid] = source_kind
+            display_status = f"{status} (Checking...)"
+
+            item = self.tree.insert("", "end", values=("Fetching...", mid, display_status, "Checking...", dt))
+
+            if is_enabled:
+                self.tree.item(item, tags=('active',))
+            else:
+                self.tree.item(item, tags=('inactive',))
+
+            cached_photo = self.image_cache.get(mid)
+            if cached_photo is not None:
+                self.tree.item(item, image=cached_photo)
+
+            # A bounded pool keeps large mod lists from firing hundreds of
+            # simultaneous requests at Steam.
+            self.metadata_executor.submit(
+                self.fetch_mod_info_for_tree,
+                item, mid, m_time, status, game_context, self.refresh_generation,
+            )
+
+        self.ui(self.update_tree_tags)
+
+    def safe_tree_set(self, item, col, value):
+        try:
+            if self.tree.exists(item):
+                self.tree.set(item, col, value)
+        except tk.TclError:
+            pass
+
+    def add_tag(self, item, tag):
+        if self.tree.exists(item):
+            tags = list(self.tree.item(item, "tags"))
+            if tag not in tags:
+                tags.append(tag)
+                self.tree.item(item, tags=tags)
+
+    def safe_tree_set_for_game(self, game_key, item, col, value):
+        if game_key != self.current_game_key:
+            return
+        self.safe_tree_set(item, col, value)
+
+    def add_tree_tag_for_game(self, game_key, item, tag):
+        if game_key != self.current_game_key:
+            return
+        self.add_tag(item, tag)
+
+    def set_tree_image(self, item, raw_data, mid):
+        if not self.tree.exists(item): return
+        try:
+            img = Image.open(BytesIO(raw_data))
+            img.thumbnail((36, 36), Image.Resampling.LANCZOS)
+            photo = ImageTk.PhotoImage(img)
+            self.image_cache[mid] = photo
+            self.tree.item(item, image=photo)
+        except Exception: pass
+
+    def set_tree_image_for_game(self, game_key, item, raw_data, mid):
+        if game_key != self.current_game_key:
+            return
+        self.set_tree_image(item, raw_data, mid)
+
+    def get_workshop_metadata(self, mid):
+        """Fetch (and cache) the Workshop page metadata for a mod."""
+        metadata = self.metadata_cache.get(mid)
+        if metadata is None:
+            url = f"https://steamcommunity.com/sharedfiles/filedetails/?id={mid}&l=english"
+            metadata = parse_workshop_metadata(self.fetch_url_text(url))
+            self.metadata_cache.set(mid, metadata)
+        return metadata
+
+    def fetch_mod_info_for_tree(self, item, mid, local_ts, base_status, game_context, generation):
+        """Worker: fetch mod name and check for updates."""
+        game_key = game_context["key"]
+        if generation != self.refresh_generation:
+            return  # The list was refreshed again; this row no longer exists.
+        try:
+            metadata = self.get_workshop_metadata(mid)
+            title = metadata.title or mid
+
+            if HAS_PIL and metadata.thumbnail_url and mid not in self.image_cache:
+                try:
+                    raw = self.fetch_url_bytes(metadata.thumbnail_url)
+                    self.ui(lambda: self.set_tree_image_for_game(game_key, item, raw, mid))
+                except Exception:
+                    pass
+
+            remote_date_str = metadata.remote_date_text or "Unknown"
+            is_out_of_date = is_remote_newer(metadata.remote_date_text, local_ts)
+
+            final_status = base_status
+            if is_out_of_date:
+                final_status = f"{base_status} (OUT OF DATE)"
+                self.ui(lambda: self.add_tree_tag_for_game(game_key, item, "update_needed"))
+                v_status = f"Remote: {remote_date_str}"
+            elif metadata.remote_date_text:
+                v_status = "UP TO DATE"
+            else:
+                v_status = "Unknown"
+
+            self.ui(lambda: self.safe_tree_set_for_game(game_key, item, "Name", title))
+            self.ui(lambda: self.safe_tree_set_for_game(game_key, item, "Version", v_status))
+            self.ui(lambda: self.safe_tree_set_for_game(game_key, item, "Status", final_status))
+        except Exception:
+            self.ui(lambda: self.safe_tree_set_for_game(game_key, item, "Name", f"ID: {mid} (Fetch Error)"))
+            self.ui(lambda: self.safe_tree_set_for_game(game_key, item, "Status", base_status))
+
+    def enable_mod(self):
+        """Enable selected mods from either the managed cache or detected Steam Workshop."""
+        selected = self.tree.selection()
+        if not selected:
+            return
+
+        mods_to_enable = [str(self.tree.item(item)['values'][1]) for item in selected]
+        source_paths = {mid: self.mod_source_paths.get(mid) for mid in mods_to_enable}
+        cache_path = self.cache_var.get()
+        game_context = self.build_game_context()
+        game_path = game_context["game_path"]
+        use_physical = self.resolve_deploy_mode(game_path, self.use_physical_var.get())
+        if use_physical is None:
+            return
+
+        self.start_task()
+        threading.Thread(
+            target=self._enable_mod_worker,
+            args=(mods_to_enable, source_paths, cache_path, game_context, use_physical),
+            daemon=True
+        ).start()
+
+    def _enable_mod_worker(self, mods, source_paths, cache_path, game_context, use_physical):
+        try:
+            cache_root = self.ensure_cache_root(cache_path)
+            for mid in mods:
+                if self.stop_event.is_set():
+                    break
+
+                current_appid = game_context["appid"]
+                src = source_paths.get(mid)
+                if not src or not os.path.exists(src):
+                    src = self.build_mod_cache_path(cache_root, current_appid, mid)
+                dst = os.path.join(game_context["game_path"], "mods", mid)
+
+                try:
+                    deployed = self.deploy_mod(mid, src, dst, use_physical)
+                    if deployed:
+                        action = "Physical Copy" if use_physical else ("Junction created" if IS_WINDOWS else "Symlink created")
+                        self.log(f"Mod {mid} enabled ({action}).", "success")
+                except Exception as e:
+                    self.log(f"Link Error for {mid}: {e}", "error")
+        finally:
+            self.end_task(self.refresh_list if not self.stop_event.is_set() else None)
+
+    def disable_mod(self):
+        """Disables all selected mods by removing their Junction links."""
+        selected = self.tree.selection()
+        if not selected: return
+        
+        mods_to_disable = [str(self.tree.item(item)['values'][1]) for item in selected]
+        game_path = self.path_var.get()
+        self.start_task()
+        threading.Thread(target=self._disable_mod_worker, args=(mods_to_disable, game_path), daemon=True).start()
+
+    def _disable_mod_worker(self, mods, game_path):
+        try:
+            for mid in mods:
+                if self.stop_event.is_set(): break
+                dst = os.path.join(game_path, "mods", mid)
+                
+                try:
+                    if os.path.lexists(dst):
+                        # Links/junctions are removed without touching their target;
+                        # Physical Copy deployments are real folders and are deleted
+                        # (the source copy stays in the cache or Steam library).
+                        self.remove_path_strict(dst)
+                        self.log(f"Mod {mid} decoupled from game engine.", "info")
+                except Exception as e:
+                    self.log(f"DECOUPLE ERROR for {mid}: {e}", "error")
+        finally:
+            self.end_task(self.refresh_list if not self.stop_event.is_set() else None)
+
+    def is_junction(self, path):
+        """Detect a Windows junction/reparse point or a symlink."""
+        get_attributes = ctypes.windll.kernel32.GetFileAttributesW if (IS_WINDOWS and ctypes) else None
+        return is_link_or_junction(path, IS_WINDOWS, get_attributes)
+
+    def get_fs_type(self, path):
+        if not IS_WINDOWS or not ctypes or not path:
+            return None
+        try:
+            drive = os.path.splitdrive(os.path.abspath(path))[0]
+            if not drive:
+                return None
+            root = drive + "\\"
+            fs_name_buf = ctypes.create_unicode_buffer(255)
+            serial = ctypes.c_ulong()
+            max_comp = ctypes.c_ulong()
+            flags = ctypes.c_ulong()
+            res = ctypes.windll.kernel32.GetVolumeInformationW(
+                root,
+                None,
+                0,
+                ctypes.byref(serial),
+                ctypes.byref(max_comp),
+                ctypes.byref(flags),
+                fs_name_buf,
+                ctypes.sizeof(fs_name_buf)
+            )
+            if res:
+                return fs_name_buf.value
+        except Exception:
+            pass
+        return None
+
+    def junction_supported(self, path):
+        if not IS_WINDOWS:
+            return True, None
+        fs = self.get_fs_type(path)
+        if not fs:
+            return True, None
+        return (fs.upper() == "NTFS"), fs
+
+    def resolve_deploy_mode(self, game_path, use_physical):
+        if use_physical:
+            return True
+        if not game_path:
+            messagebox.showerror("Game Path Required", "Please select your Game Installation folder so mods can be installed.")
+            return None
+        ok, fs = self.junction_supported(game_path)
+        if ok:
+            return False
+
+        fs_name = fs if fs else "Unknown"
+        msg = (
+            "Your Game Path is on a filesystem that cannot create Junction links.\n\n"
+            f"Detected: {fs_name}\n\n"
+            "Solutions:\n"
+            "• Use Physical Copy (recommended)\n"
+            "• Move the game to an NTFS drive\n"
+            "• Change the Mod Cache / Game Path to an NTFS drive\n\n"
+            "Enable Physical Copy now?"
+        )
+        result = messagebox.askyesnocancel("Junctions Not Supported", msg)
+        if result is None:
+            self.log("Deployment cancelled by user.", "warning")
+            return None
+        if result:
+            self.use_physical_var.set(True)
+            self.save_config()
+            self.log("Switched to Physical Copy mode due to non-NTFS game drive.", "warning")
+            return True
+        self.log("Deployment aborted: Junctions not supported on game drive.", "error")
+        return None
+
+    def remove_path_strict(self, path):
+        """Remove a link, junction, file or folder; raises on failure."""
+        util_remove_path(path, self.is_junction)
+
+    def remove_existing_path(self, path):
+        try:
+            self.remove_path_strict(path)
+            return True
+        except Exception as e:
+            self.log(f"Failed to remove existing path: {path} ({e})", "warning")
+            return False
+
+    def update_all_mods(self):
+        """Batch triggers SteamCMD for every out-of-date item currently in the list."""
+        items = self.tree.get_children()
+        if not items:
+            self.log("No mods detected in cache for update.", "warning")
+            return
+        
+        to_update = []
+        for item in items:
+            if "update_needed" in self.tree.item(item, "tags"):
+                to_update.append(str(self.tree.item(item)['values'][1]))
+        
+        if not to_update:
+            self.log("All mods are up to date.", "success")
+            return
+
+        game_context = self.build_game_context()
+        use_physical = self.resolve_deploy_mode(game_context["game_path"], self.use_physical_var.get())
+        if use_physical is None:
+            return
+
+        if not self.begin_download_batch():
+            self.log("A download or update batch is already running.", "warning")
+            return
+
+        self.log(f"Initializing batch update for {len(to_update)} mods...", "info")
+        self.dl_btn.config(state="disabled", text="ENGINE ACTIVE")
+        self.progress.config(mode="indeterminate")
+        self.progress.start(10)
+        self.progress_label.config(text="INITIALIZING...", fg=self.colors['accent'])
+        self.start_task()
+        threading.Thread(
+            target=self.download_logic,
+            args=(to_update, self.steamcmd_var.get(), self.cache_var.get(), game_context, use_physical),
+            daemon=True
+        ).start()
+
+    def delete_mod_physically(self):
+        """Delete managed cache copies and break links without touching Steam-owned files."""
+        selected = self.tree.selection()
+        if not selected:
+            return
+
+        mods_to_delete = [str(self.tree.item(item)['values'][1]) for item in selected]
+        steam_managed = [
+            mid for mid in mods_to_delete
+            if self.mod_source_kinds.get(mid) == "steam"
+        ]
+        count = len(mods_to_delete)
+
+        if count == 1:
+            prompt_message = f"Remove Mod ID {mods_to_delete[0]} from the Mod Engine?"
+        else:
+            prompt_message = f"Remove {count} selected mods from the Mod Engine?"
+
+        if steam_managed:
+            prompt_message += (
+                "\n\nSteam-managed Workshop files will NOT be deleted. "
+                "Only links and any Mod Engine cached copies are removed."
+            )
+        else:
+            prompt_message += "\n\nThis deletes the Mod Engine cached copy from disk."
+
+        if messagebox.askyesno("TERMINATE ASSET(S)", prompt_message):
+            cache_path = self.cache_var.get()
+            game_context = self.build_game_context()
+            self.start_task()
+            threading.Thread(
+                target=self._delete_mod_worker,
+                args=(mods_to_delete, cache_path, game_context),
+                daemon=True
+            ).start()
+
+    def _delete_mod_worker(self, mods, cache_path, game_context):
+        try:
+            cache_root = os.path.abspath(cache_path) if cache_path else ""
+            # The marker is never created here: it is what authorises deletion.
+            cache_is_safe = self.is_safe_cache_root(cache_root)
+            if not cache_is_safe:
+                self.log(
+                    "Mod Cache is not marked as a Mod Engine cache; only game links will be removed.",
+                    "warning",
+                )
+
+            for mid in mods:
+                if self.stop_event.is_set():
+                    break
+
+                link_path = os.path.join(game_context["game_path"], "mods", mid)
+                if os.path.lexists(link_path):
+                    self.remove_existing_path(link_path)
+
+                if not cache_is_safe:
+                    continue
+
+                mod_cache_path = self.build_mod_cache_path(cache_root, game_context["appid"], mid)
+                if os.path.exists(mod_cache_path):
+                    if self.remove_existing_path(mod_cache_path):
+                        self.metadata_cache.discard(mid)
+                        self.log(f"Asset {mid} purged from the Mod Engine cache.", "warning")
+                    else:
+                        self.log(f"Purge Error for {mid}: the cached copy could not be removed.", "error")
+                elif self.mod_source_kinds.get(mid) == "steam":
+                    self.log(
+                        f"Asset {mid} is Steam-managed; external Workshop content was left untouched.",
+                        "warning",
+                    )
+
+        finally:
+            self.end_task(self.refresh_list if not self.stop_event.is_set() else None)
+
+    def update_selected_mod(self, force=False):
+        """Triggers a single re-download batch via SteamCMD for the selected mods."""
+        selected = self.tree.selection()
+        if not selected:
+            return
+
+        game_context = self.build_game_context()
+        use_physical = self.resolve_deploy_mode(game_context["game_path"], self.use_physical_var.get())
+        if use_physical is None:
+            return
+
+        mod_ids = []
+        for item in selected:
+            mid = str(self.tree.item(item)['values'][1])
+            
+            if not force and "update_needed" not in self.tree.item(item, "tags"):
+                self.log(f"Mod {mid} is up to date.", "info")
+                continue
+
+            mod_ids.append(mid)
+
+        if not mod_ids:
+            return
+
+        if not self.begin_download_batch():
+            self.log("A download or update batch is already running.", "warning")
+            return
+
+        self.log(f"Updating {len(mod_ids)} mod(s)...", "info")
+        self.dl_btn.config(state="disabled", text="ENGINE ACTIVE")
+        self.progress.config(mode="indeterminate")
+        self.progress.start(10)
+        self.progress_label.config(text="INITIALIZING...", fg=self.colors['accent'])
+        self.start_task()
+        threading.Thread(
+            target=self.download_logic,
+            args=(mod_ids, self.steamcmd_var.get(), self.cache_var.get(), game_context, use_physical),
+            daemon=True
+        ).start()
+if __name__ == "__main__":
+    root = TkinterDnD.Tk() if HAS_DND else tk.Tk()
+    app = BZModMaster(root)
+    root.protocol("WM_DELETE_WINDOW", app.shutdown)
+    root.mainloop()

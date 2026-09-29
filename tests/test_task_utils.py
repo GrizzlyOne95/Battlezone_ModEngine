@@ -1,6 +1,9 @@
+import contextlib
+import io
+import threading
 import unittest
 
-from task_utils import TaskState, calculate_batch_progress
+from task_utils import TaskState, TtlCache, UiDispatcher, calculate_batch_progress
 
 
 class TaskUtilsTests(unittest.TestCase):
@@ -48,6 +51,40 @@ class TaskUtilsTests(unittest.TestCase):
         progress = calculate_batch_progress(50.0, 0, 0)
         self.assertEqual(progress["label_text"], "IDLE")
         self.assertEqual(progress["total_percent"], 0.0)
+
+
+    def test_ui_dispatcher_runs_callbacks_in_order_and_survives_errors(self):
+        dispatcher = UiDispatcher()
+        seen = []
+        dispatcher.post(lambda: seen.append(1))
+        dispatcher.post(lambda: 1 / 0)
+        dispatcher.post(lambda: seen.append(2))
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(dispatcher.drain(), 3)
+        self.assertEqual(seen, [1, 2])
+        self.assertEqual(dispatcher.drain(), 0)
+
+    def test_ui_dispatcher_accepts_posts_from_other_threads(self):
+        dispatcher = UiDispatcher()
+        seen = []
+        workers = [threading.Thread(target=dispatcher.post, args=(lambda i=i: seen.append(i),)) for i in range(20)]
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join()
+        dispatcher.drain()
+        self.assertEqual(sorted(seen), list(range(20)))
+
+    def test_ttl_cache_expires_and_discards(self):
+        now = [0.0]
+        cache = TtlCache(10, clock=lambda: now[0])
+        cache.set("a", 1)
+        self.assertEqual(cache.get("a"), 1)
+        now[0] = 11
+        self.assertIsNone(cache.get("a"))
+        cache.set("b", 2)
+        cache.discard("b")
+        self.assertIsNone(cache.get("b"))
 
 
 if __name__ == "__main__":
