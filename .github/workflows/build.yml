@@ -18,16 +18,32 @@ jobs:
       id-token: write
       attestations: write
     strategy:
+      fail-fast: false
       matrix:
-        os: [windows-latest, ubuntu-latest, macos-latest]
+        include:
+          - os: windows-latest
+            platform: windows
+          # PyInstaller binaries only run on distros whose glibc is at least
+          # the build machine's. Build in Debian 11 (glibc 2.31) so the release
+          # runs on Ubuntu 20.04+, Debian 11+, Mint 20+, SteamOS 3 and newer.
+          - os: ubuntu-latest
+            platform: linux
+            container: python:3.11-bullseye
+          # One build per Mac architecture: Apple Silicon and Intel.
+          - os: macos-latest
+            platform: macos-arm64
+          - os: macos-15-intel
+            platform: macos-x86_64
 
     runs-on: ${{ matrix.os }}
+    container: ${{ matrix.container }}
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Set up Python
+        if: ${{ !matrix.container }}
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
         with:
           python-version: "3.11"
@@ -40,11 +56,11 @@ jobs:
         run: |
           python -m unittest discover -s tests
 
-      - name: Install Linux dependencies
+      - name: Check Tk is available (Linux)
         if: runner.os == 'Linux'
         run: |
-          sudo apt-get update
-          sudo apt-get install -y libtk8.6 tk8.6-dev
+          python -c "import tkinter; print('Tk', tkinter.TkVersion)"
+          ldd --version | head -n 1
 
       - name: Generate canonical app icon
         run: |
@@ -104,6 +120,7 @@ jobs:
           test ! -d dist/BZModEngine
           chmod +x dist/BZModEngine
           ls -lh dist/BZModEngine
+          file dist/BZModEngine
 
       - name: Package release (Windows)
         if: runner.os == 'Windows'
@@ -126,8 +143,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          tar -czf "Battlezone_ModEngine-${{ steps.version.outputs.tag }}-macos.tar.gz" -C dist BZModEngine
-          ls -lh "Battlezone_ModEngine-${{ steps.version.outputs.tag }}-macos.tar.gz"
+          tar -czf "Battlezone_ModEngine-${{ steps.version.outputs.tag }}-${{ matrix.platform }}.tar.gz" -C dist BZModEngine
+          ls -lh "Battlezone_ModEngine-${{ steps.version.outputs.tag }}-${{ matrix.platform }}.tar.gz"
 
       - name: Attest build provenance
         if: github.event_name != 'pull_request'
@@ -157,8 +174,8 @@ jobs:
         if: runner.os == 'macOS'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: Battlezone_ModEngine-macos
-          path: Battlezone_ModEngine-*-macos.tar.gz
+          name: Battlezone_ModEngine-${{ matrix.platform }}
+          path: Battlezone_ModEngine-*-${{ matrix.platform }}.tar.gz
           if-no-files-found: error
 
   # Decide whether this run publishes a release:
@@ -196,6 +213,19 @@ jobs:
       cancel-in-progress: false
 
     steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Extract changelog for this release
+        shell: bash
+        run: |
+          set -euo pipefail
+          scripts/extract_changelog.sh "${{ needs.check-release.outputs.tag }}" > release_notes.md
+          if [[ ! -s release_notes.md ]]; then
+            echo "No CHANGELOG.md entry for ${{ needs.check-release.outputs.tag }}." > release_notes.md
+          fi
+          cat release_notes.md
+
       - name: Download all artifacts
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
@@ -210,6 +240,8 @@ jobs:
           files: |
             artifacts/Battlezone_ModEngine-windows/Battlezone_ModEngine-v*-windows.zip
             artifacts/Battlezone_ModEngine-linux/Battlezone_ModEngine-v*-linux.tar.gz
-            artifacts/Battlezone_ModEngine-macos/Battlezone_ModEngine-v*-macos.tar.gz
+            artifacts/Battlezone_ModEngine-macos-arm64/Battlezone_ModEngine-v*-macos-arm64.tar.gz
+            artifacts/Battlezone_ModEngine-macos-x86_64/Battlezone_ModEngine-v*-macos-x86_64.tar.gz
           fail_on_unmatched_files: true
+          body_path: release_notes.md
           generate_release_notes: true

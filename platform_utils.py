@@ -34,7 +34,33 @@ def get_steamcmd_candidates(bin_dir: str, is_windows: bool, is_linux: bool, cwd:
             "/usr/bin/steamcmd",
         ]
 
-    return [get_default_steamcmd_path(bin_dir, False)]
+    # macOS: Valve's tarball, or the Homebrew cask wrapper.
+    return [
+        get_default_steamcmd_path(bin_dir, False),
+        os.path.join(resolved_home, "steamcmd", "steamcmd.sh"),
+        os.path.join(resolved_home, "Library", "Application Support", "SteamCMD", "steamcmd.sh"),
+        "/opt/homebrew/bin/steamcmd",
+        "/usr/local/bin/steamcmd",
+    ]
+
+
+def get_subprocess_env(is_linux: bool, frozen: bool, env=None) -> dict | None:
+    """Environment for external programs started from a packaged build.
+
+    PyInstaller's Linux bootloader points LD_LIBRARY_PATH at the libraries
+    bundled inside the app. Browsers, file managers, Steam and SteamCMD must
+    not inherit that, or they can fail to start. The original value is kept
+    in LD_LIBRARY_PATH_ORIG. Returns None when no change is needed.
+    """
+    if not (is_linux and frozen):
+        return None
+    env = dict(os.environ if env is None else env)
+    original = env.pop("LD_LIBRARY_PATH_ORIG", None)
+    if original:
+        env["LD_LIBRARY_PATH"] = original
+    else:
+        env.pop("LD_LIBRARY_PATH", None)
+    return env
 
 
 def get_popen_output_kwargs(is_windows: bool, subprocess_module=subprocess) -> dict:
@@ -77,7 +103,15 @@ def terminate_process_tree(process, is_windows: bool, os_module=os, subprocess_m
             pass
 
 
-def open_path(target: str, is_windows: bool, is_linux: bool, os_module=os, subprocess_module=subprocess) -> None:
+def open_path(
+    target: str,
+    is_windows: bool,
+    is_linux: bool,
+    os_module=os,
+    subprocess_module=subprocess,
+    env=None,
+) -> None:
+    """Open a folder, file or URL (https://, steam://) with the system handler."""
     if is_windows:
         os_module.startfile(target)
         return
@@ -87,4 +121,5 @@ def open_path(target: str, is_windows: bool, is_linux: bool, os_module=os, subpr
         [opener, target],
         stdout=subprocess_module.DEVNULL,
         stderr=subprocess_module.DEVNULL,
+        env=env,
     )

@@ -1,6 +1,6 @@
 import os
 import sys
-import re
+import tarfile
 import zipfile
 import subprocess
 import threading
@@ -11,7 +11,6 @@ from datetime import datetime
 from io import BytesIO
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
-import webbrowser
 
 from config_utils import get_user_config_dir as util_get_user_config_dir, load_config as util_load_config, save_config as util_save_config
 from deploy_utils import (
@@ -22,6 +21,10 @@ from deploy_utils import (
     collect_workshop_mod_sources as util_collect_workshop_mod_sources,
     create_directory_link as util_create_directory_link,
     deploy_mod as util_deploy_mod,
+    is_directory_writable,
+    find_dangling_links,
+    find_links_into,
+    get_mods_dir,
     ensure_cache_root as util_ensure_cache_root,
     get_cache_marker_path as util_get_cache_marker_path,
     get_latest_mtime,
@@ -45,6 +48,7 @@ from platform_utils import (
     get_popen_output_kwargs as util_get_popen_output_kwargs,
     get_steamcmd_candidates as util_get_steamcmd_candidates,
     get_steamcmd_name as util_get_steamcmd_name,
+    get_subprocess_env,
     open_path as util_open_path,
     terminate_process_tree,
 )
@@ -52,7 +56,10 @@ from steamcmd_utils import (
     build_workshop_download_command,
     classify_workshop_items,
     ensure_console_language_file,
+    final_batch_status,
+    get_steamcmd_download_url,
     parse_steamcmd_output_line,
+    safe_extract_tar,
     safe_extract_zip,
     should_log_noisy_line,
     summarize_download_batch,
@@ -62,12 +69,15 @@ from workshop_parser import (
     classify_workshop_app,
     extract_required_item_ids,
     is_remote_newer,
+    parse_workshop_id,
     parse_workshop_metadata,
 )
 
 # Platform-specific imports
 IS_WINDOWS = platform.system() == "Windows"
 IS_LINUX = platform.system() == "Linux"
+IS_MAC = platform.system() == "Darwin"
+IS_FROZEN = bool(getattr(sys, "frozen", False))
 
 if IS_WINDOWS:
     import winreg
@@ -91,7 +101,6 @@ except ImportError:
     HAS_DND = False
 
 # --- CONFIGURATION ---
-STEAMCMD_URL = "https://steamcdn-a.akamaihd.net/client/installer/steamcmd.zip"
 CONFIG_FILE = "bz_mod_config.json"
 CACHE_MARKER_FILE = ".bz_mod_cache"
 HTTP_TIMEOUT = 15
@@ -285,7 +294,6 @@ class BZModMaster:
             pass
 
         self.setup_ui()
-        self.check_admin()
         
         # Always resolve metadata for the active install so a saved Steam path
         # still retains its Steam library / Workshop relationship.
@@ -358,10 +366,25 @@ class BZModMaster:
         return util_get_steamcmd_candidates(self.bin_dir, IS_WINDOWS, IS_LINUX)
 
     def get_popen_output_kwargs(self):
-        return util_get_popen_output_kwargs(IS_WINDOWS)
+        kwargs = util_get_popen_output_kwargs(IS_WINDOWS)
+        env = self.get_subprocess_env()
+        if env is not None:
+            kwargs["env"] = env
+        return kwargs
+
+    def get_subprocess_env(self):
+        return get_subprocess_env(IS_LINUX, IS_FROZEN)
 
     def open_path(self, target):
-        util_open_path(target, IS_WINDOWS, IS_LINUX)
+        util_open_path(target, IS_WINDOWS, IS_LINUX, env=self.get_subprocess_env())
+
+    def bind_context_menu(self, widget, handler):
+        """Bind the platform's secondary click: right button, or Control-click on macOS."""
+        widget.bind("<Button-3>", handler)
+        if IS_MAC:
+            # Aqua Tk reports the right button as Button-2.
+            widget.bind("<Button-2>", handler)
+            widget.bind("<Control-Button-1>", handler)
 
     def build_game_context(self, game_key=None, game_path=None):
         resolved_key = game_key or self.current_game_key
@@ -481,8 +504,24 @@ class BZModMaster:
         self.game_selector.pack(side="left", padx=10)
         self.game_selector.bind("<<ComboboxSelected>>", self.switch_game)
 
-        ttk.Checkbutton(game_row, text="Advanced Mode", variable=self.advanced_mode_var, 
+        ttk.Checkbutton(game_row, text="Advanced Mode", variable=self.advanced_mode_var,
                        command=self.toggle_ui_mode).pack(side="right", padx=10)
+        physical_toggle = ttk.Checkbutton(
+            game_row,
+            text="Physical Copy",
+            variable=self.use_physical_var,
+            command=self.on_physical_copy_toggled,
+        )
+        physical_toggle.pack(side="right", padx=10)
+        ToolTip(
+            physical_toggle,
+            "OFF (default): mods are linked into the game folder; no files are duplicated.\n"
+            "ON: each enabled mod is copied into the game folder. Use this only when\n"
+            "links cannot work, e.g. a game on an exFAT/FAT32 drive or a sandboxed launcher.\n"
+            "Already enabled mods switch over the next time they are enabled or updated.",
+            bg="#1a1a1a",
+            fg=self.colors['accent'],
+        )
 
         self.icon_label = tk.Label(game_row, bg=self.colors["bg"])
         self.icon_label.pack(side="left", padx=5)
@@ -636,17 +675,17 @@ class BZModMaster:
         
         if HAS_DND:
             self.mod_entry.drop_target_register(DND_TEXT)
-            self.mod_entry.dnd_bind('<<Drop>>', lambda e: self.mod_id_var.set(e.data.strip("{}")))
-            
+            self.mod_entry.dnd_bind('<<Drop>>', lambda e: self.mod_id_var.set(e.data.strip().strip("{}")))
+
             self.thumb_label.drop_target_register(DND_TEXT)
-            self.thumb_label.dnd_bind('<<Drop>>', lambda e: self.mod_id_var.set(e.data.strip("{}")))
+            self.thumb_label.dnd_bind('<<Drop>>', lambda e: self.mod_id_var.set(e.data.strip().strip("{}")))
         self.mod_id_var.trace_add("write", self.on_input_change)
 
         # Context Menu for Inputs
         self.input_menu = tk.Menu(self.root, tearoff=0, bg="#1a1a1a", fg=self.colors['fg'])
         self.input_menu.add_command(label="PASTE FROM CLIPBOARD", command=self.paste_from_clipboard)
-        self.thumb_label.bind("<Button-3>", self.show_input_menu)
-        self.mod_entry.bind("<Button-3>", self.show_input_menu)
+        self.bind_context_menu(self.thumb_label, self.show_input_menu)
+        self.bind_context_menu(self.mod_entry, self.show_input_menu)
 
         btn_row = ttk.Frame(info_frame)
         btn_row.pack(fill="x", pady=5)
@@ -696,7 +735,8 @@ class BZModMaster:
         self.tree.column("Name", width=250) 
         
         self.tree.pack(fill="both", expand=True, padx=10, pady=10)
-        self.tree.bind("<Button-3>", self.show_mod_menu)
+        self.bind_context_menu(self.tree, self.show_mod_menu)
+        self.tree.bind("<Double-1>", self.on_tree_double_click)
         self.tree.bind("<ButtonPress-1>", self.on_tree_press)
         self.tree.bind("<B1-Motion>", self.on_tree_motion)
         manage_ctrl = ttk.Frame(self.manage_tab)
@@ -707,7 +747,14 @@ class BZModMaster:
         
         self.manage_help_lbl = tk.Label(manage_ctrl, text="?", width=2, bg="#222", fg=self.colors['accent'], font=("Consolas", 8, "bold"), cursor="hand2")
         self.manage_help_lbl.pack(side="left", padx=10)
-        self.manage_help_tip = ToolTip(self.manage_help_lbl, "CONTROLS:\n• Double-Click: Toggle Enable/Disable\n• Right-Click: Context Menu\n• Drag/Shift+Click: Multi-Select", bg="#1a1a1a", fg=self.colors['accent'])
+        context_hint = "Right-Click or Control-Click" if IS_MAC else "Right-Click"
+        self.manage_help_tip = ToolTip(
+            self.manage_help_lbl,
+            "CONTROLS:\n• Double-Click: Toggle Enable/Disable\n"
+            f"• {context_hint}: Context Menu\n• Drag/Shift+Click: Multi-Select",
+            bg="#1a1a1a",
+            fg=self.colors['accent'],
+        )
 
         ttk.Button(manage_ctrl, text="UPDATE ALL", command=self.update_all_mods).pack(side="right")
 
@@ -884,6 +931,23 @@ class BZModMaster:
         if self.mod_id_var.get():
             self.on_input_change()
 
+    def on_physical_copy_toggled(self):
+        mode = "Physical Copy (mods are copied)" if self.use_physical_var.get() else "Linking (no duplicate files)"
+        self.log(f"Deployment mode: {mode}. Re-enable mods to apply it to existing ones.", "info")
+        self.save_config()
+
+    def on_tree_double_click(self, event):
+        item = self.tree.identify_row(event.y)
+        if not item or self.tree.identify_region(event.x, event.y) not in ("cell", "tree"):
+            return
+        self.tree.selection_set(item)
+        status = str(self.tree.set(item, "Status"))
+        mid = str(self.tree.set(item, "ID"))
+        if status.startswith("ENABLED") or self.mod_source_kinds.get(mid) == "missing":
+            self.disable_mod()
+        else:
+            self.enable_mod()
+
     def clear_hud_log(self):
         self.log_box.config(state="normal")
         self.log_box.delete("1.0", "end")
@@ -953,13 +1017,24 @@ class BZModMaster:
         if progress_state["button_text"]:
             self.dl_btn.config(text=progress_state["button_text"])
 
+    def permission_hint(self, error):
+        if isinstance(error, PermissionError) and IS_WINDOWS and not self.is_running_as_admin():
+            return " (The game folder is write-protected; use RELAUNCH AS ADMIN or move the game.)"
+        return ""
+
     def _abort_download_ui(self):
         self.release_download_batch()
         self.dl_btn.config(text="INSTALL MOD", state="normal")
         self.reset_progress()
         self.end_task()
 
-    def _prompt_deps_and_start(self, queue, deps, sc_path, cache_path, game_context):
+    def _prompt_deps_and_start(self, queue, deps, sc_path, cache_path, game_context, use_physical):
+        if self.stop_event.is_set():
+            self.log("Install cancelled.", "warning")
+            self._abort_download_ui()
+            return
+
+        deps = [dep for dep in deps if dep not in queue]
         try:
             if deps:
                 if messagebox.askyesno("Dependencies Found", f"This mod requires {len(deps)} other items.\nDownload them as well?"):
@@ -967,8 +1042,8 @@ class BZModMaster:
         except Exception as e:
             self.log(f"Dependency prompt failed: {e}", "warning")
 
-        use_physical = self.resolve_deploy_mode(game_context["game_path"], self.use_physical_var.get())
-        if use_physical is None:
+        if self.stop_event.is_set():
+            self.log("Install cancelled.", "warning")
             self._abort_download_ui()
             return
 
@@ -1000,6 +1075,10 @@ class BZModMaster:
             )
             return
 
+        use_physical = self.resolve_deploy_mode(self.build_game_context()["game_path"], self.use_physical_var.get())
+        if use_physical is None:
+            return
+
         if not self.begin_download_batch():
             self.log("A download or update batch is already running.", "warning")
             return
@@ -1020,7 +1099,7 @@ class BZModMaster:
                 deps = self.get_dependencies(mid)
             except Exception as e:
                 self.log(f"Dependency Check Failed: {e}", "warning")
-            self.ui(lambda: self._prompt_deps_and_start(queue, deps, sc_path, cache_path, game_context))
+            self.ui(lambda: self._prompt_deps_and_start(queue, deps, sc_path, cache_path, game_context, use_physical))
 
         threading.Thread(target=deps_worker, daemon=True).start()
 
@@ -1031,8 +1110,13 @@ class BZModMaster:
         try:
             current_appid = game_context["appid"]
             game_path = game_context["game_path"]
+            mods_dir = get_mods_dir(game_path)
             final_sc_path = self.ensure_steamcmd(sc_path)
             cache = self.ensure_cache_root(cache_path)
+            if self.stop_event.is_set():
+                self.log("Download cancelled before SteamCMD started.", "warning")
+                final_button_text = "CANCELLED"
+                return
 
             if ensure_console_language_file(final_sc_path) is None:
                 self.log("Could not write SteamConsole.txt next to SteamCMD; continuing without it.")
@@ -1048,7 +1132,13 @@ class BZModMaster:
 
             cmd = build_workshop_download_command(final_sc_path, cache, current_appid, mod_ids)
 
-            p = subprocess.Popen(cmd, **self.get_popen_output_kwargs())
+            try:
+                p = subprocess.Popen(cmd, **self.get_popen_output_kwargs())
+            except OSError as e:
+                hint = ""
+                if IS_LINUX:
+                    hint = " SteamCMD needs 32-bit libraries (Debian/Ubuntu: lib32gcc-s1, Arch: lib32-gcc-libs)."
+                raise RuntimeError(f"Could not start SteamCMD ({e}).{hint}") from e
             self.active_processes.append(p)
 
             completed_count = 0
@@ -1106,6 +1196,12 @@ class BZModMaster:
 
             if p.returncode not in (0, None):
                 self.log(f"SteamCMD exited with code {p.returncode}.", "warning")
+                if IS_LINUX and p.returncode == 127:
+                    self.log(
+                        "SteamCMD could not start its 32-bit program. Install 32-bit libraries "
+                        "(Debian/Ubuntu: lib32gcc-s1, Arch: lib32-gcc-libs) and try again.",
+                        "error",
+                    )
 
             outcome = summarize_download_batch(
                 mod_ids,
@@ -1120,13 +1216,13 @@ class BZModMaster:
             deploy_failures = 0
             for mid in outcome["downloaded"] + outcome["stale"]:
                 src = os.path.normpath(self.build_mod_cache_path(cache, current_appid, mid))
-                dst = os.path.normpath(os.path.join(game_path, "mods", mid))
+                dst = os.path.normpath(os.path.join(mods_dir, mid))
 
                 deployed_ok = False
                 try:
                     deployed_ok = self.deploy_mod(mid, src, dst, use_physical)
                 except Exception as e:
-                    self.log(f"Link creation failed for {mid}: {e}", "error")
+                    self.log(f"Link creation failed for {mid}: {e}{self.permission_hint(e)}", "error")
                 if deployed_ok:
                     self.log(f"Deployment complete: {mid}", "success")
                 else:
@@ -1135,9 +1231,7 @@ class BZModMaster:
 
             for mid in outcome["downloaded"]:
                 self.metadata_cache.discard(mid)
-            final_button_text = outcome["status"]
-            if deploy_failures:
-                final_button_text = "FAILED" if deploy_failures == total_items else "PARTIAL"
+            final_button_text = final_batch_status(outcome, deploy_failures)
 
         except Exception as e:
             self.log(f"CRITICAL: {e}", "error")
@@ -1173,7 +1267,11 @@ class BZModMaster:
 
     def open_workshop(self):
         appid = self.games[self.current_game_key]["appid"]
-        webbrowser.open(f"https://steamcommunity.com/app/{appid}/workshop/")
+        url = f"https://steamcommunity.com/app/{appid}/workshop/"
+        try:
+            self.open_path(url)
+        except Exception as e:
+            self.log(f"Could not open your web browser: {e}. Visit {url}", "error")
 
     def fetch_preview(self, mid, game_context):
         """Worker thread: fetch Workshop metadata; all UI/state updates go via self.ui."""
@@ -1241,88 +1339,157 @@ class BZModMaster:
         except Exception: pass
 
     def sanitize_id(self, input_str):
-        match = re.search(r'id=(\d+)', input_str)
-        return match.group(1) if match else (input_str.strip() if input_str.strip().isdigit() else None)
+        return parse_workshop_id(input_str)
 
     def initialize_engine(self):
         game_name = self.games[self.current_game_key]["name"]
-        self.log(f"{game_name} Engine Initializing...", "info")
-        
-        # Check Game Path - Logic adjusted for your test environment
-        game_exe = os.path.join(self.path_var.get(), self.games[self.current_game_key]["exe"])
-        if not os.path.exists(game_exe):
-            self.log("NOTICE: Executable not found. Running in Virtual/Test mode.", "warning")
-            self.path_entry.configure(foreground="#ffff44") # Yellow for "Mock Mode"
-        else:
-            self.log(f"System Link Established: {game_exe}", "success")
-            self.path_entry.configure(foreground=self.colors['accent'])
-        
-        # Check SteamCMD
-        if not os.path.exists(self.steamcmd_var.get()):
-            self.log("WARNING: SteamCMD missing. Downloads disabled.", "warning")
-            self.steamcmd_entry.configure(foreground="#ffff44")
-        else:
-            self.log("SteamCMD Binary: Verified.", "success")
+        self.log(f"{game_name} selected.", "info")
 
-        self.log("Ready for mod deployment.", "info")
+        if self.is_valid_game_install():
+            game_exe = os.path.join(self.path_var.get(), self.games[self.current_game_key]["exe"])
+            self.log(f"Game found: {game_exe}", "success")
+            self.path_entry.configure(foreground=self.colors['accent'])
+        else:
+            self.log(
+                f"{game_name} was not found. Click DETECT or BROWSE to select the game folder "
+                "before installing mods.",
+                "warning",
+            )
+            self.path_entry.configure(foreground="#ffff44")
+
+        sc_path = self.steamcmd_var.get()
+        if sc_path and os.path.isfile(sc_path):
+            self.log("SteamCMD found.", "success")
+        else:
+            self.log("SteamCMD is not installed yet; it will be downloaded automatically on your first install.", "info")
+            self.steamcmd_entry.configure(foreground="#ffff44")
+
+        self.log("Ready.", "info")
 
     def ensure_steamcmd(self, target):
         if not target:
             target = self.get_default_steamcmd_path()
             self.ui(lambda: self.steamcmd_var.set(target))
-            
-        if not os.path.exists(target):
-            if not IS_WINDOWS:
-                raise FileNotFoundError("SteamCMD was not found. Install steamcmd and point the app to the executable.")
 
-            target_dir = os.path.dirname(target)
-            self.log(f"SteamCMD missing. Downloading to {target_dir}...", "warning")
-            os.makedirs(target_dir, exist_ok=True)
-            zip_p = os.path.join(target_dir, "sc.zip")
-            try:
-                with open(zip_p, "wb") as handle:
-                    handle.write(self.fetch_url_bytes(STEAMCMD_URL, timeout=120))
-                with zipfile.ZipFile(zip_p, 'r') as z:
-                    safe_extract_zip(z, target_dir)
-                os.remove(zip_p)
-                self.log("SteamCMD installed successfully.", "success")
-            except Exception as e:
-                self.log(f"SteamCMD Setup Error: {e}", "error")
-                raise e
+        if os.path.isdir(target):
+            target = os.path.join(target, self.get_steamcmd_name())
+
+        if not os.path.exists(target):
+            if os.path.basename(target).lower() != self.get_steamcmd_name():
+                raise FileNotFoundError(
+                    f"SteamCMD was not found at {target}. Use DETECT or BROWSE in Advanced Mode to fix the SteamCMD path."
+                )
+            self.install_steamcmd(target)
+            self.ui(self.save_config)
         return target
 
-    def check_admin(self):
-        if IS_WINDOWS and ctypes:
-            if not ctypes.windll.shell32.IsUserAnAdmin():
-                self.log("NOTICE: Non-Admin mode detected.", "error")
-                self.show_admin_warning()
-        # Linux doesn't need admin for symlinks
+    def install_steamcmd(self, target):
+        """Download Valve's SteamCMD package for this platform next to ``target``."""
+        target_dir = os.path.dirname(os.path.abspath(target))
+        url = get_steamcmd_download_url(IS_WINDOWS, IS_LINUX)
+        self.log(f"SteamCMD missing. Downloading to {target_dir}...", "warning")
+        os.makedirs(target_dir, exist_ok=True)
+        archive_path = os.path.join(target_dir, "steamcmd_download.tmp")
+        try:
+            with open(archive_path, "wb") as handle:
+                handle.write(self.fetch_url_bytes(url, timeout=120))
+            if url.endswith(".zip"):
+                with zipfile.ZipFile(archive_path, "r") as archive:
+                    safe_extract_zip(archive, target_dir)
+            else:
+                with tarfile.open(archive_path, "r:gz") as archive:
+                    safe_extract_tar(archive, target_dir)
+            if not os.path.isfile(target):
+                raise FileNotFoundError(f"The SteamCMD package did not contain {os.path.basename(target)}.")
+            if not IS_WINDOWS:
+                os.chmod(target, os.stat(target).st_mode | 0o111)
+            self.log("SteamCMD installed successfully.", "success")
+            if IS_LINUX:
+                self.log(
+                    "Note: SteamCMD on Linux needs 32-bit libraries "
+                    "(Debian/Ubuntu: lib32gcc-s1, Arch: lib32-gcc-libs).",
+                    "info",
+                )
+        except Exception as e:
+            self.log(f"SteamCMD Setup Error: {e}", "error")
+            raise
+        finally:
+            try:
+                os.remove(archive_path)
+            except OSError:
+                pass
 
-    def show_admin_warning(self):
-        self.admin_frame = tk.Frame(self.dl_tab, bg="#330000", pady=2)
-        children = self.dl_tab.winfo_children()
-        if children:
-            self.admin_frame.pack(side="top", fill="x", padx=10, pady=(5,0), before=children[0])
-        else:
-            self.admin_frame.pack(side="top", fill="x", padx=10, pady=5)
-            
-        lbl = tk.Label(self.admin_frame, text="⚠ ADMIN OR NTFS REQUIRED FOR JUNCTIONS", 
-                       bg="#330000", fg="#ff5555", font=("Consolas", 10, "bold"))
-        lbl.pack(side="left", padx=10)
-        
-        btn = ttk.Button(self.admin_frame, text="RELAUNCH AS ADMIN", command=self.relaunch_admin)
-        btn.pack(side="right", padx=5, pady=2)
-        ToolTip(lbl, "Windows requires NTFS to create junctions.\nIf your game is on exFAT, use Physical Copy or move to NTFS.")
+    def is_running_as_admin(self):
+        if not (IS_WINDOWS and ctypes):
+            return False
+        try:
+            return bool(ctypes.windll.shell32.IsUserAnAdmin())
+        except Exception:
+            return False
+
+    def update_admin_banner(self):
+        """Offer elevation only when the game folder really needs it.
+
+        Junctions do not need admin rights; a game installed under a protected
+        folder such as Program Files does, because ``mods`` must be written there.
+        Running elevated otherwise only breaks drag-and-drop from the browser.
+        """
+        if not hasattr(self, "dl_tab"):
+            return
+        needs_admin = (
+            IS_WINDOWS
+            and self.is_valid_game_install()
+            and not is_directory_writable(self.path_var.get())
+            and not self.is_running_as_admin()
+        )
+        if not needs_admin:
+            if getattr(self, "admin_frame", None) is not None:
+                self.admin_frame.pack_forget()
+            return
+
+        if getattr(self, "admin_frame", None) is None:
+            self.admin_frame = tk.Frame(self.dl_tab, bg="#330000", pady=2)
+            lbl = tk.Label(self.admin_frame, text="⚠ GAME FOLDER IS WRITE-PROTECTED: ADMIN RIGHTS NEEDED TO INSTALL MODS",
+                           bg="#330000", fg="#ff5555", font=("Consolas", 10, "bold"))
+            lbl.pack(side="left", padx=10)
+            ToolTip(lbl, "Your game is installed in a protected folder (such as Program Files),\n"
+                         "so the Mod Engine cannot create its mods folder there.\n"
+                         "Relaunch as administrator, or move the game to a folder you own.")
+            btn = ttk.Button(self.admin_frame, text="RELAUNCH AS ADMIN", command=self.relaunch_admin)
+            btn.pack(side="right", padx=5, pady=2)
+
+        if not self.admin_frame.winfo_ismapped():
+            others = [w for w in self.dl_tab.pack_slaves() if w is not self.admin_frame]
+            if others:
+                self.admin_frame.pack(side="top", fill="x", padx=10, pady=(5, 0), before=others[0])
+            else:
+                self.admin_frame.pack(side="top", fill="x", padx=10, pady=5)
 
     def relaunch_admin(self):
+        if not (IS_WINDOWS and ctypes):
+            return
+        if self.task_state.has_active_tasks:
+            self.log("Wait for the current operation to finish before relaunching.", "warning")
+            return
         try:
-            if getattr(sys, 'frozen', False):
-                ctypes.windll.shell32.ShellExecuteW(None, "runas", sys.executable, "", None, 1)
+            if IS_FROZEN:
+                params = subprocess.list2cmdline(sys.argv[1:])
             else:
-                ctypes.windll.shell32.ShellExecuteW(None, "runas", sys.executable, f'"{os.path.abspath(sys.argv[0])}"', None, 1)
-            self.root.destroy()
+                params = subprocess.list2cmdline([os.path.abspath(sys.argv[0]), *sys.argv[1:]])
+            self.save_config()
+            # ShellExecuteW does not raise when the UAC prompt is declined; it
+            # returns a value <= 32. Only close this window once the elevated
+            # copy has actually started.
+            result = ctypes.windll.shell32.ShellExecuteW(
+                None, "runas", sys.executable, params, self.base_dir, 1
+            )
         except Exception as e:
             self.log(f"Relaunch failed: {e}", "error")
+            return
+        if int(result) <= 32:
+            self.log("Relaunch as administrator was cancelled.", "warning")
+            return
+        self.shutdown()
 
     def browse_game(self): 
         p = filedialog.askdirectory()
@@ -1337,51 +1504,56 @@ class BZModMaster:
                 )
                 return
 
+            if not self.is_valid_game_install(new_path):
+                game = self.games[self.current_game_key]
+                messagebox.showwarning(
+                    "Game Not Found",
+                    f"{game['exe']} was not found in:\n{new_path}\n\n"
+                    f"Select the folder that contains {game['name']}'s {game['exe']}.",
+                )
+                return
+
             self.path_var.set(new_path)
             self.path_entry.configure(foreground=self.colors['accent']) # Reset color
-            if self.is_valid_game_install(new_path):
-                self.auto_detect_game()
-            else:
-                self.game_install_sources[self.current_game_key] = "configured"
-                self.game_workshop_dirs[self.current_game_key] = ""
-                self.save_config()
-                self.update_install_ui()
-            self.log(f"Game path updated: {p}", "success")
+            self.auto_detect_game()
+            self.log(f"Game path updated: {new_path}", "success")
 
-    def browse_steamcmd(self): 
-        if IS_WINDOWS:
-            result = messagebox.askyesnocancel(
-                "SteamCMD Setup",
-                "Do you already have SteamCMD installed?\n\nYES: Browse for existing steamcmd.exe\nNO: Select a folder to download a new copy\nCANCEL: Abort"
-            )
-            if result is None:
-                return
-            if result:
-                p = filedialog.askopenfilename(filetypes=[("Executable", "steamcmd.exe"), ("All Executables", "*.exe")])
-                if p:
-                    self.steamcmd_var.set(os.path.normpath(p))
-                    self.steamcmd_entry.configure(foreground=self.colors['accent'])
-                    self.save_config()
-                    self.log(f"SteamCMD path updated: {p}", "success")
-            else:
-                p = filedialog.askdirectory(title="Select Install Location for SteamCMD")
-                if p:
-                    target = os.path.join(p, self.get_steamcmd_name())
-                    self.steamcmd_var.set(os.path.normpath(target))
-                    self.steamcmd_entry.configure(foreground=self.colors['accent'])
-                    self.save_config()
-                    self.log(f"SteamCMD will be installed to: {p}", "info")
-            return
-
-        p = filedialog.askopenfilename(
-            title="Select SteamCMD executable",
-            filetypes=[("SteamCMD", "steamcmd*"), ("All Files", "*.*")]
+    def browse_steamcmd(self):
+        sc_name = self.get_steamcmd_name()
+        result = messagebox.askyesnocancel(
+            "SteamCMD Setup",
+            "Do you already have SteamCMD installed?\n\n"
+            f"YES: Browse for an existing {'steamcmd.exe' if IS_WINDOWS else 'steamcmd.sh or steamcmd'}\n"
+            "NO: Select a folder to download a new copy into\n"
+            "CANCEL: Abort",
         )
-        if p:
-            self.steamcmd_var.set(os.path.normpath(p))
-            self.steamcmd_entry.configure(foreground=self.colors['accent'])
-            self.save_config()
-            self.log(f"SteamCMD path updated: {p}", "success")
+        if result is None:
+            return
+        if result:
+            if IS_WINDOWS:
+                filetypes = [("SteamCMD", "steamcmd.exe"), ("All Executables", "*.exe")]
+            elif IS_MAC:
+                # Aqua Tk filters by extension only; a name pattern would hide every file.
+                filetypes = None
+            else:
+                filetypes = [("SteamCMD", "steamcmd*"), ("All Files", "*")]
+            kwargs = {"title": "Select SteamCMD executable"}
+            if filetypes:
+                kwargs["filetypes"] = filetypes
+            p = filedialog.askopenfilename(**kwargs)
+            if p:
+                self.steamcmd_var.set(os.path.normpath(p))
+                self.steamcmd_entry.configure(foreground=self.colors['accent'])
+                self.save_config()
+                self.log(f"SteamCMD path updated: {p}", "success")
+        else:
+            p = filedialog.askdirectory(title="Select Install Location for SteamCMD")
+            if p:
+                target = os.path.join(p, sc_name)
+                self.steamcmd_var.set(os.path.normpath(target))
+                self.steamcmd_entry.configure(foreground=self.colors['accent'])
+                self.save_config()
+                self.log(f"SteamCMD will be downloaded to {p} on your next install.", "info")
 
     def browse_cache(self): 
         p = filedialog.askdirectory()
@@ -1408,8 +1580,7 @@ class BZModMaster:
             # In Simple Mode, if Game Path is missing, prompt for it now
             if not self.advanced_mode_var.get():
                 game_path = self.path_var.get()
-                exe_name = self.games[self.current_game_key]["exe"]
-                if not game_path or not os.path.exists(os.path.join(game_path, exe_name)):
+                if not self.is_valid_game_install(game_path):
                     messagebox.showinfo("Game Location Required", "Please select your Game Installation folder so mods can be installed.")
                     self.browse_game()
 
@@ -1435,7 +1606,27 @@ class BZModMaster:
             return "Mod Cache cannot overlap Steam's own Workshop folder."
         return None
 
+    def is_download_running(self, action):
+        with self.task_lock:
+            running = self.task_state.download_active
+        if running:
+            messagebox.showwarning(
+                "Download In Progress",
+                f"Wait for the current download to finish (or press STOP) before you {action}.",
+            )
+        return running
+
+    def get_known_game_paths(self):
+        paths = []
+        for key in self.games:
+            path = self.path_var.get() if key == self.current_game_key else self.config.get(f"path_{key}", "")
+            if path and os.path.isabs(path) and not any(self.paths_match(path, p) for p in paths):
+                paths.append(path)
+        return paths
+
     def clear_cache(self):
+        if self.is_download_running("clear the cache"):
+            return
         cache_path = self.cache_var.get()
         if not cache_path or not os.path.exists(cache_path):
             messagebox.showinfo("Cache Empty", "The cache folder does not exist.")
@@ -1468,8 +1659,20 @@ class BZModMaster:
             )
             return
 
-        if messagebox.askyesno("Clear Cache", f"Are you sure you want to delete all files in:\n{cache_path}\n\nThis will force re-download of all mods."):
+        if messagebox.askyesno(
+            "Clear Cache",
+            f"Are you sure you want to delete all files in:\n{cache_path}\n\n"
+            "Mods enabled from this cache are disabled too, and must be downloaded again.\n"
+            "Physical copies and Steam-managed Workshop items are not affected.",
+        ):
             try:
+                # Remove the game's links first: once their targets are gone
+                # they would be left dangling and no longer listed anywhere.
+                for game_path in self.get_known_game_paths():
+                    mods_dir = os.path.join(game_path, "mods")
+                    for link in find_links_into(mods_dir, cache_root, self.is_junction):
+                        if self.remove_existing_path(link):
+                            self.log(f"Disabled {os.path.basename(link)} (linked to the cache).", "info")
                 self.clear_directory_contents(cache_root, preserve_names={CACHE_MARKER_FILE})
                 self.log(
                     "Mod Engine cache cleared successfully. Steam-managed Workshop content was left untouched.",
@@ -1484,7 +1687,7 @@ class BZModMaster:
     def launch_game(self):
         game = self.games[self.current_game_key]
         exe = os.path.join(self.path_var.get(), game["exe"])
-        if os.path.exists(exe):
+        if self.is_valid_game_install():
             try:
                 if IS_WINDOWS:
                     subprocess.Popen([exe], cwd=self.path_var.get())
@@ -1492,9 +1695,10 @@ class BZModMaster:
                     # The game is a Windows build; let Steam start it through Proton.
                     self.open_path(f"steam://rungameid/{game['appid']}")
                 else:
+                    launchers = "CrossOver, Whisky, Wine" if IS_MAC else "Heroic, Lutris, Wine"
                     messagebox.showinfo(
                         "Launch From Your Launcher",
-                        "This is a Windows game build. Start it from Heroic, Lutris, Wine or "
+                        f"This is a Windows game build. Start it from {launchers} or "
                         "whichever launcher you installed it with; enabled mods are picked up automatically.",
                     )
                     return
@@ -1534,6 +1738,8 @@ class BZModMaster:
 
         if hasattr(self, "workshop_open_btn"):
             self.workshop_open_btn.configure(state=workshop_state)
+
+        self.update_admin_banner()
 
     def auto_detect_game(self, verbose=False):
         game_key = self.current_game_key
@@ -1641,11 +1847,19 @@ class BZModMaster:
 
     def _refresh_scan_logic(self, cache_path, game_context):
         try:
-            base_cache = self.ensure_cache_root(cache_path)
             game_dir = game_context["game_path"]
+            if not game_dir or not self.is_valid_game_install(game_dir, game_context["key"]):
+                self.log(
+                    f"SCAN SKIPPED: {game_context['name']} was not found. Click DETECT or BROWSE to select the game folder.",
+                    "error",
+                )
+                self.ui(lambda: self._populate_tree([], game_context))
+                return
 
-            if not game_dir:
-                self.log("SCAN FAILED: Game path is not configured.", "error")
+            try:
+                base_cache = self.ensure_cache_root(cache_path)
+            except Exception as e:
+                self.log(f"SCAN FAILED: Mod Cache folder is not usable ({e}).", "error")
                 self.ui(lambda: self._populate_tree([], game_context))
                 return
 
@@ -1667,7 +1881,12 @@ class BZModMaster:
                 except Exception:
                     pass
 
-            if not mod_sources:
+            # Links whose target is gone (cache cleared, Steam unsubscribed).
+            # They are listed even without a source so they can be removed.
+            dangling = set(find_dangling_links(game_mods_dir, self.is_junction))
+            orphaned = sorted(mid for mid in dangling if mid.isdigit() and mid not in mod_sources)
+
+            if not mod_sources and not orphaned:
                 locations = [cache_content_dir, *external_dirs]
                 self.log(
                     "No Workshop content found in: " + " | ".join(locations),
@@ -1685,6 +1904,12 @@ class BZModMaster:
                 )
             else:
                 self.log(f"Found {cache_count} item(s) in the Mod Engine cache.", "success")
+            if orphaned:
+                self.log(
+                    f"{len(orphaned)} enabled mod(s) point to files that no longer exist. "
+                    "Disable them, or reinstall them.",
+                    "warning",
+                )
 
             scan_data = []
             for mid, source_info in mod_sources.items():
@@ -1695,8 +1920,12 @@ class BZModMaster:
                 source_kind = source_info["source"]
                 link_path = os.path.join(game_mods_dir, mid)
 
-                is_enabled = os.path.lexists(link_path)
-                status = "ENABLED" if is_enabled else "DISABLED"
+                if mid in dangling:
+                    status, is_enabled = "BROKEN LINK", False
+                elif os.path.lexists(link_path):
+                    status, is_enabled = "ENABLED", True
+                else:
+                    status, is_enabled = "DISABLED", False
 
                 try:
                     m_time = get_latest_mtime(mod_path)
@@ -1709,7 +1938,12 @@ class BZModMaster:
                     (mid, status, is_enabled, m_time, dt, mod_path, source_kind)
                 )
 
+            for mid in orphaned:
+                scan_data.append((mid, "BROKEN LINK", False, 0, "Missing", "", "missing"))
+
             self.ui(lambda: self._populate_tree(scan_data, game_context))
+        except Exception as e:
+            self.log(f"SCAN FAILED: {e}", "error")
         finally:
             self.end_task()
 
@@ -1741,7 +1975,7 @@ class BZModMaster:
             # simultaneous requests at Steam.
             self.metadata_executor.submit(
                 self.fetch_mod_info_for_tree,
-                item, mid, m_time, status, game_context, self.refresh_generation,
+                item, mid, m_time, status, game_context, self.refresh_generation, source_kind,
             )
 
         self.ui(self.update_tree_tags)
@@ -1794,7 +2028,7 @@ class BZModMaster:
             self.metadata_cache.set(mid, metadata)
         return metadata
 
-    def fetch_mod_info_for_tree(self, item, mid, local_ts, base_status, game_context, generation):
+    def fetch_mod_info_for_tree(self, item, mid, local_ts, base_status, game_context, generation, source_kind="cache"):
         """Worker: fetch mod name and check for updates."""
         game_key = game_context["key"]
         if generation != self.refresh_generation:
@@ -1811,10 +2045,16 @@ class BZModMaster:
                     pass
 
             remote_date_str = metadata.remote_date_text or "Unknown"
-            is_out_of_date = is_remote_newer(metadata.remote_date_text, local_ts)
+            # Steam keeps subscribed items current itself; updating them with
+            # SteamCMD would only download a duplicate into the cache.
+            is_out_of_date = source_kind == "cache" and is_remote_newer(metadata.remote_date_text, local_ts)
 
             final_status = base_status
-            if is_out_of_date:
+            if source_kind == "steam":
+                v_status = "Updated by Steam"
+            elif source_kind == "missing":
+                v_status = "Files missing"
+            elif is_out_of_date:
                 final_status = f"{base_status} (OUT OF DATE)"
                 self.ui(lambda: self.add_tree_tag_for_game(game_key, item, "update_needed"))
                 v_status = f"Remote: {remote_date_str}"
@@ -1854,6 +2094,7 @@ class BZModMaster:
 
     def _enable_mod_worker(self, mods, source_paths, cache_path, game_context, use_physical):
         try:
+            mods_dir = get_mods_dir(game_context["game_path"])
             cache_root = self.ensure_cache_root(cache_path)
             for mid in mods:
                 if self.stop_event.is_set():
@@ -1863,15 +2104,23 @@ class BZModMaster:
                 src = source_paths.get(mid)
                 if not src or not os.path.exists(src):
                     src = self.build_mod_cache_path(cache_root, current_appid, mid)
-                dst = os.path.join(game_context["game_path"], "mods", mid)
+                dst = os.path.join(mods_dir, mid)
 
                 try:
                     deployed = self.deploy_mod(mid, src, dst, use_physical)
                     if deployed:
                         action = "Physical Copy" if use_physical else ("Junction created" if IS_WINDOWS else "Symlink created")
                         self.log(f"Mod {mid} enabled ({action}).", "success")
+                    else:
+                        self.log(
+                            f"Mod {mid} could not be enabled: its files are missing. "
+                            "Reinstall it from the Downloader tab, or use FORCE UPDATE.",
+                            "error",
+                        )
                 except Exception as e:
-                    self.log(f"Link Error for {mid}: {e}", "error")
+                    self.log(f"Link Error for {mid}: {e}{self.permission_hint(e)}", "error")
+        except Exception as e:
+            self.log(f"Enable failed: {e}", "error")
         finally:
             self.end_task(self.refresh_list if not self.stop_event.is_set() else None)
 
@@ -1887,9 +2136,10 @@ class BZModMaster:
 
     def _disable_mod_worker(self, mods, game_path):
         try:
+            mods_dir = get_mods_dir(os.path.abspath(game_path) if game_path else "")
             for mid in mods:
                 if self.stop_event.is_set(): break
-                dst = os.path.join(game_path, "mods", mid)
+                dst = os.path.join(mods_dir, mid)
                 
                 try:
                     if os.path.lexists(dst):
@@ -1899,7 +2149,9 @@ class BZModMaster:
                         self.remove_path_strict(dst)
                         self.log(f"Mod {mid} decoupled from game engine.", "info")
                 except Exception as e:
-                    self.log(f"DECOUPLE ERROR for {mid}: {e}", "error")
+                    self.log(f"DECOUPLE ERROR for {mid}: {e}{self.permission_hint(e)}", "error")
+        except Exception as e:
+            self.log(f"Disable failed: {e}", "error")
         finally:
             self.end_task(self.refresh_list if not self.stop_event.is_set() else None)
 
@@ -1945,11 +2197,19 @@ class BZModMaster:
         return (fs.upper() == "NTFS"), fs
 
     def resolve_deploy_mode(self, game_path, use_physical):
+        # Checked for both modes: a missing or wrong game path would put mods
+        # somewhere the game never reads (or relative to the working folder).
+        if not game_path or not os.path.isabs(game_path) or not self.is_valid_game_install(game_path):
+            game = self.games[self.current_game_key]
+            location = f" in:\n{game_path}" if game_path else ""
+            messagebox.showerror(
+                "Game Path Required",
+                f"{game['name']} was not found{location}.\n\n"
+                "Click DETECT or BROWSE to select the game folder so mods can be installed.",
+            )
+            return None
         if use_physical:
             return True
-        if not game_path:
-            messagebox.showerror("Game Path Required", "Please select your Game Installation folder so mods can be installed.")
-            return None
         ok, fs = self.junction_supported(game_path)
         if ok:
             return False
@@ -2031,6 +2291,9 @@ class BZModMaster:
         if not selected:
             return
 
+        if self.is_download_running("delete mods"):
+            return
+
         mods_to_delete = [str(self.tree.item(item)['values'][1]) for item in selected]
         steam_managed = [
             mid for mid in mods_to_delete
@@ -2076,9 +2339,11 @@ class BZModMaster:
                 if self.stop_event.is_set():
                     break
 
-                link_path = os.path.join(game_context["game_path"], "mods", mid)
-                if os.path.lexists(link_path):
-                    self.remove_existing_path(link_path)
+                game_path = game_context["game_path"]
+                if game_path and os.path.isabs(game_path):
+                    link_path = os.path.join(get_mods_dir(game_path), mid)
+                    if os.path.lexists(link_path):
+                        self.remove_existing_path(link_path)
 
                 if not cache_is_safe:
                     continue
@@ -2105,15 +2370,17 @@ class BZModMaster:
         if not selected:
             return
 
-        game_context = self.build_game_context()
-        use_physical = self.resolve_deploy_mode(game_context["game_path"], self.use_physical_var.get())
-        if use_physical is None:
-            return
-
         mod_ids = []
         for item in selected:
             mid = str(self.tree.item(item)['values'][1])
-            
+
+            if self.mod_source_kinds.get(mid) == "steam":
+                self.log(
+                    f"Mod {mid} is a Steam subscription; Steam keeps it up to date, so it was skipped.",
+                    "info",
+                )
+                continue
+
             if not force and "update_needed" not in self.tree.item(item, "tags"):
                 self.log(f"Mod {mid} is up to date.", "info")
                 continue
@@ -2121,6 +2388,11 @@ class BZModMaster:
             mod_ids.append(mid)
 
         if not mod_ids:
+            return
+
+        game_context = self.build_game_context()
+        use_physical = self.resolve_deploy_mode(game_context["game_path"], self.use_physical_var.get())
+        if use_physical is None:
             return
 
         if not self.begin_download_batch():

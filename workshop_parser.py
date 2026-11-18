@@ -28,6 +28,28 @@ class WorkshopMetadata:
     remote_date_text: str | None
 
 
+WORKSHOP_ID_PATTERNS = (
+    # https://steamcommunity.com/sharedfiles/filedetails/?id=123 (also &id=)
+    re.compile(r"[?&]id=(\d+)"),
+    # steam://url/CommunityFilePage/123, as dragged from the Steam client
+    re.compile(r"CommunityFilePage/(\d+)", re.IGNORECASE),
+)
+
+
+def parse_workshop_id(text: str | None) -> str | None:
+    """Extract a Workshop item ID from a bare ID, a web link or a steam:// link."""
+    if not text:
+        return None
+    value = text.strip().strip("{}").strip()
+    if value.isdigit():
+        return value
+    for pattern in WORKSHOP_ID_PATTERNS:
+        match = pattern.search(value)
+        if match:
+            return match.group(1)
+    return None
+
+
 def extract_required_item_ids(html: str) -> list[str]:
     start_match = re.search(r'<div[^>]*class="requiredItemsContainer"[^>]*>', html)
     if not start_match:
@@ -107,8 +129,15 @@ def parse_workshop_datetime(date_text: str | None, now: datetime | None = None) 
         return None
 
     try:
-        day = int(parts[0])
-        month = MONTHS.get(parts[1])
+        # Steam picks the order from the visitor's region:
+        # "23 Oct, 2016 @ 3:47pm" or "Oct 23, 2016 @ 3:47pm" (year omitted
+        # for dates in the current year).
+        if parts[0] in MONTHS:
+            month = MONTHS[parts[0]]
+            day = int(parts[1])
+        else:
+            day = int(parts[0])
+            month = MONTHS.get(parts[1])
         if month is None:
             return None
 

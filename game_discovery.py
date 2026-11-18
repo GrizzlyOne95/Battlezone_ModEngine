@@ -38,7 +38,20 @@ def is_valid_game_path(game: dict, path: str | None) -> bool:
     exe_name = game.get("exe", "")
     if not exe_name:
         return False
-    return os.path.isfile(os.path.join(os.path.normpath(path), exe_name))
+    folder = os.path.normpath(path)
+    if os.path.isfile(os.path.join(folder, exe_name)):
+        return True
+    # Linux/macOS filesystems are case-sensitive; installers and Wine prefixes
+    # do not always keep the executable's original capitalisation.
+    try:
+        entries = os.listdir(folder)
+    except OSError:
+        return False
+    wanted = exe_name.lower()
+    return any(
+        entry.lower() == wanted and os.path.isfile(os.path.join(folder, entry))
+        for entry in entries
+    )
 
 
 def _paths_match(left: str | None, right: str | None) -> bool:
@@ -516,6 +529,24 @@ def _heroic_config_roots(home: str) -> list[str]:
     )
 
 
+HEROIC_SKIP_DIRS = frozenset(
+    {
+        "store_cache",
+        "cache",
+        "code cache",
+        "gpucache",
+        "dawncache",
+        "partitions",
+        "session storage",
+        "local storage",
+        "logs",
+        "tools",
+        "images-cache",
+    }
+)
+HEROIC_MAX_JSON_BYTES = 2 * 1024 * 1024
+
+
 def _collect_heroic_paths(node, identifiers: set[str], inherited_match=False) -> list[str]:
     paths = []
 
@@ -587,7 +618,10 @@ def get_linux_heroic_paths(game: dict, env=None, home: str | None = None) -> lis
         for config_root in _heroic_config_roots(resolved_home):
             if not os.path.isdir(config_root):
                 continue
-            for root, _, files in os.walk(config_root):
+            for root, dirs, files in os.walk(config_root):
+                # Skip Heroic's store caches and Electron data: they can hold
+                # tens of MB of JSON and never record install locations.
+                dirs[:] = [d for d in dirs if d.lower() not in HEROIC_SKIP_DIRS]
                 for filename in files:
                     if files_seen >= 200:
                         break
@@ -596,7 +630,7 @@ def get_linux_heroic_paths(game: dict, env=None, home: str | None = None) -> lis
                     files_seen += 1
                     json_path = os.path.join(root, filename)
                     try:
-                        if os.path.getsize(json_path) > 10 * 1024 * 1024:
+                        if os.path.getsize(json_path) > HEROIC_MAX_JSON_BYTES:
                             continue
                         with open(json_path, "r", encoding="utf-8", errors="replace") as handle:
                             data = json.load(handle)

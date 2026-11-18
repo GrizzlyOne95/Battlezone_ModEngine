@@ -36,6 +36,55 @@ def safe_extract_zip(zip_file, target_dir: str) -> None:
     zip_file.extractall(root)
 
 
+STEAMCMD_DOWNLOAD_URLS = {
+    "windows": "https://steamcdn-a.akamaihd.net/client/installer/steamcmd.zip",
+    "linux": "https://steamcdn-a.akamaihd.net/client/installer/steamcmd_linux.tar.gz",
+    "macos": "https://steamcdn-a.akamaihd.net/client/installer/steamcmd_osx.tar.gz",
+}
+
+
+def get_steamcmd_download_url(is_windows: bool, is_linux: bool) -> str:
+    if is_windows:
+        return STEAMCMD_DOWNLOAD_URLS["windows"]
+    if is_linux:
+        return STEAMCMD_DOWNLOAD_URLS["linux"]
+    return STEAMCMD_DOWNLOAD_URLS["macos"]
+
+
+def safe_extract_tar(tar_file, target_dir: str) -> None:
+    """Extract a tar archive, refusing links and members outside ``target_dir``.
+
+    Unlike zip extraction this keeps the executable bits that steamcmd.sh and
+    the SteamCMD binaries need on Linux and macOS.
+    """
+    root = os.path.realpath(target_dir)
+    members = tar_file.getmembers()
+    for member in members:
+        destination = os.path.realpath(os.path.join(root, member.name))
+        if os.path.commonpath([root, destination]) != root:
+            raise ValueError(f"Unsafe path in archive: {member.name}")
+        if member.issym() or member.islnk():
+            # macOS frameworks use relative links such as Versions/Current.
+            # Allow those, but never a link that points outside the target.
+            if os.path.isabs(member.linkname):
+                raise ValueError(f"Unsafe link in archive: {member.name}")
+            base = os.path.dirname(destination) if member.issym() else root
+            link_target = os.path.realpath(os.path.join(base, member.linkname))
+            if os.path.commonpath([root, link_target]) != root:
+                raise ValueError(f"Unsafe link in archive: {member.name}")
+        elif not (member.isfile() or member.isdir()):
+            raise ValueError(f"Unsupported entry in archive: {member.name}")
+    for member in members:
+        tar_file.extract(member, root, set_attrs=True, **_tar_filter_kwargs())
+
+
+def _tar_filter_kwargs() -> dict:
+    import tarfile
+
+    # Python 3.12+ warns unless a filter is given; members were vetted above.
+    return {"filter": "tar"} if hasattr(tarfile, "tar_filter") else {}
+
+
 def build_workshop_download_command(steamcmd_path: str, cache_path: str, appid: str, mod_ids: list[str]) -> list[str]:
     cmd = [steamcmd_path, "+force_install_dir", cache_path, "+login", "anonymous"]
     for mid in mod_ids:
@@ -101,3 +150,14 @@ def summarize_download_batch(mod_ids: list[str], succeeded, exists_locally) -> d
     else:
         status = "FAILED"
     return {"downloaded": downloaded, "stale": stale, "missing": missing, "status": status}
+
+
+def final_batch_status(outcome: dict, deploy_failures: int) -> str:
+    """Overall result once deployment has been attempted for a batch."""
+    attempted = len(outcome["downloaded"]) + len(outcome["stale"])
+    deployed = attempted - deploy_failures
+    if deployed <= 0:
+        return "FAILED"
+    if deploy_failures or outcome["stale"] or outcome["missing"]:
+        return "PARTIAL"
+    return "DEPLOYED"
