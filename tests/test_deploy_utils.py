@@ -293,9 +293,10 @@ class DeployUtilsTests(unittest.TestCase):
             self.assertEqual(os.listdir(dst), ["old.txt"])
 
     def test_partial_copy_path_is_outside_mods_folder(self):
-        dst = os.path.join(os.sep, "game", "mods", "123")
+        game = os.path.abspath(os.path.join(os.sep, "game"))
+        dst = os.path.join(game, "mods", "123")
         staging = get_partial_copy_path(dst)
-        self.assertEqual(os.path.dirname(staging), os.path.join(os.sep, "game"))
+        self.assertEqual(os.path.dirname(staging), game)
         self.assertTrue(os.path.basename(staging).startswith("."))
 
     def test_get_mods_dir_rejects_empty_and_relative_paths(self):
