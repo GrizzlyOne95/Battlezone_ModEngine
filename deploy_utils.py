@@ -209,6 +209,103 @@ def remove_path(path: str, is_link) -> None:
         os.remove(path)
 
 
+def get_mods_dir(game_path: str) -> str:
+    """The game's ``mods`` folder. Refuses empty or relative game paths.
+
+    A relative path would resolve against the process working directory (for
+    an elevated relaunch on Windows that is System32), so mods would be
+    written somewhere the game never looks.
+    """
+    if not game_path or not os.path.isabs(game_path):
+        raise ValueError("Game Path is not set. Select your game installation folder first.")
+    return os.path.join(game_path, "mods")
+
+
+def resolve_link_target(path: str) -> str:
+    """Where a symlink or junction points, resolved and normalised.
+
+    ``os.path.realpath`` follows Windows junctions (Python 3.8+) and still
+    returns the target of a dangling link.
+    """
+    return normalize_path(os.path.realpath(path))
+
+
+def link_points_to(link: str, target: str) -> bool:
+    return resolve_link_target(link) == normalize_path(os.path.realpath(target))
+
+
+def find_links_into(mods_dir: str, root: str, is_link) -> list[str]:
+    """Links inside ``mods_dir`` whose target is ``root`` or lives beneath it."""
+    if not mods_dir or not root or not os.path.isdir(mods_dir):
+        return []
+    real_root = normalize_path(os.path.realpath(root))
+    links = []
+    try:
+        entries = sorted(os.listdir(mods_dir))
+    except OSError:
+        return []
+    for entry in entries:
+        path = os.path.join(mods_dir, entry)
+        try:
+            if is_link(path) and is_same_or_nested_path(real_root, resolve_link_target(path)):
+                links.append(path)
+        except OSError:
+            continue
+    return links
+
+
+def find_dangling_links(mods_dir: str, is_link) -> list[str]:
+    """Names of links in ``mods_dir`` whose target no longer exists."""
+    if not mods_dir or not os.path.isdir(mods_dir):
+        return []
+    try:
+        entries = sorted(os.listdir(mods_dir))
+    except OSError:
+        return []
+    return [
+        entry
+        for entry in entries
+        if is_link(os.path.join(mods_dir, entry)) and not os.path.exists(os.path.join(mods_dir, entry))
+    ]
+
+
+def is_directory_writable(game_path: str) -> bool:
+    """Whether the Mod Engine can create entries in the game's ``mods`` folder.
+
+    Probes with a real file: on Windows ``os.access`` ignores folder ACLs such
+    as the ones protecting Program Files.
+    """
+    import tempfile
+
+    if not game_path or not os.path.isdir(game_path):
+        return False
+    mods_dir = os.path.join(game_path, "mods")
+    probe_dir = mods_dir if os.path.isdir(mods_dir) else game_path
+    try:
+        handle, probe = tempfile.mkstemp(prefix=".bzme-write-test-", dir=probe_dir)
+    except OSError:
+        return False
+    os.close(handle)
+    try:
+        os.remove(probe)
+    except OSError:
+        pass
+    return True
+
+
+PARTIAL_COPY_PREFIX = ".bzme-partial-"
+
+
+def get_partial_copy_path(dst: str) -> str:
+    """Staging folder for a Physical Copy, kept outside the game's mods folder.
+
+    It sits beside ``mods`` (same volume, so the final rename is atomic) and
+    starts with a dot so the game never tries to load a half-written copy.
+    """
+    mods_dir = os.path.dirname(os.path.abspath(dst))
+    return os.path.join(os.path.dirname(mods_dir), PARTIAL_COPY_PREFIX + os.path.basename(dst))
+
+
 def deploy_mod(src: str, dst: str, use_physical: bool, remove_path, create_link, is_link=None) -> bool:
     if not os.path.exists(src):
         return False
@@ -217,17 +314,26 @@ def deploy_mod(src: str, dst: str, use_physical: bool, remove_path, create_link,
     os.makedirs(os.path.dirname(dst), exist_ok=True)
 
     if use_physical:
+        # Copy into a staging folder first: if the app is closed mid-copy the
+        # game keeps its previous copy instead of a half-written one.
+        staging = get_partial_copy_path(dst)
+        if os.path.lexists(staging):
+            remove_path(staging)
+        shutil.copytree(src, staging)
         if os.path.lexists(dst):
             remove_path(dst)
-        shutil.copytree(src, dst)
+        os.replace(staging, dst)
         return True
 
     if os.path.lexists(dst):
-        dangling_link = is_link(dst) and not os.path.exists(dst)
-        physical_copy = not is_link(dst)
-        # A stale physical copy (from Physical Copy mode) or a broken link would
-        # otherwise keep the game on old content while reporting success.
-        if dangling_link or physical_copy:
+        linked = is_link(dst)
+        dangling_link = linked and not os.path.exists(dst)
+        physical_copy = not linked
+        # A link to a different source (e.g. Steam's Workshop copy after a
+        # Mod Engine update, or an old cache folder) would keep the game on
+        # stale content while reporting success.
+        wrong_target = linked and not dangling_link and not link_points_to(dst, src)
+        if dangling_link or physical_copy or wrong_target:
             remove_path(dst)
 
     if not os.path.lexists(dst):

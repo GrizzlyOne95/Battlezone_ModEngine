@@ -152,18 +152,22 @@ The application should auto-detect your installation. If not:
    /home/YOUR_USERNAME/Games/GOG/Battlezone 98 Redux
    ```
 
-2. **SteamCMD Path**: Click "DETECT" or set manually if needed
+2. **SteamCMD**: Nothing to do. The Mod Engine downloads SteamCMD automatically the first time you install a mod. SteamCMD needs 32-bit libraries:
+   ```bash
+   sudo pacman -S lib32-gcc-libs   # Arch/Manjaro (enable the multilib repository first)
+   sudo apt install lib32gcc-s1    # Debian/Ubuntu
+   ```
+   If you already have SteamCMD installed, tick **Advanced Mode** and click "DETECT" next to SteamCMD.
 
-3. **Mod Cache**: Default is fine (`./workshop_cache`)
+3. **Mod Cache**: The default is fine (a `workshop_cache` folder next to the Mod Engine).
 
 ## Step 8: Download Mods from Steam Workshop
 
 1. Go to [Steam Workshop for Battlezone 98 Redux](https://steamcommunity.com/app/301650/workshop/)
 2. Copy the URL or ID of a mod (e.g., `https://steamcommunity.com/sharedfiles/filedetails/?id=123456789`)
 3. Paste into the Mod Engine
-4. Click **"Install Mod"**
-5. Once downloaded, go to **"Manage Mods"** tab
-6. Right-click the mod and select **"Enable"** to create a symlink
+4. Click **"Install Mod"**. The mod is downloaded and enabled (symlinked into the game's `mods` folder) in one step.
+5. Use the **"Manage Mods"** tab to disable, re-enable, update or delete mods later: double-click a mod to toggle it, or right-click it for more options.
 
 ## Running the Game
 

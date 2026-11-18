@@ -11,6 +11,11 @@ from deploy_utils import (
     create_directory_link,
     deploy_mod,
     ensure_cache_root,
+    find_dangling_links,
+    find_links_into,
+    get_mods_dir,
+    get_partial_copy_path,
+    is_directory_writable,
     get_cache_marker_path,
     get_latest_mtime,
     is_link_or_junction,
@@ -219,7 +224,23 @@ class DeployUtilsTests(unittest.TestCase):
             self.assertTrue(os.path.exists(os.path.join(dst, "mod.txt")))
 
     @unittest.skipIf(os.name == "nt", "symlinks need privileges on Windows")
-    def test_deploy_mod_link_mode_keeps_valid_link(self):
+    def test_deploy_mod_link_mode_keeps_link_to_same_source(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            src = os.path.join(temp_dir, "cache", "123")
+            _write(os.path.join(src, "a.txt"))
+            dst = os.path.join(temp_dir, "mods", "123")
+            os.makedirs(os.path.dirname(dst))
+            _symlink(src, dst)
+
+            calls = []
+            self.assertTrue(deploy_mod(src, dst, False, _strict_remove, lambda s, d: calls.append(s)))
+            self.assertEqual(calls, [])
+            self.assertEqual(os.readlink(dst), src)
+
+    @unittest.skipIf(os.name == "nt", "symlinks need privileges on Windows")
+    def test_deploy_mod_link_mode_retargets_link_to_other_source(self):
+        # Regression: after a Mod Engine update of a Steam-linked item the link
+        # kept pointing at Steam's stale copy while reporting success.
         with tempfile.TemporaryDirectory() as temp_dir:
             src = os.path.join(temp_dir, "cache", "123")
             other = os.path.join(temp_dir, "steam", "123")
@@ -229,10 +250,10 @@ class DeployUtilsTests(unittest.TestCase):
             os.makedirs(os.path.dirname(dst))
             _symlink(other, dst)
 
-            calls = []
-            self.assertTrue(deploy_mod(src, dst, False, _strict_remove, lambda s, d: calls.append(s)))
-            self.assertEqual(calls, [])
-            self.assertEqual(os.readlink(dst), other)
+            self.assertTrue(deploy_mod(src, dst, False, _strict_remove, _symlink))
+            self.assertEqual(os.readlink(dst), src)
+            self.assertTrue(os.path.isfile(os.path.join(dst, "a.txt")))
+            self.assertTrue(os.path.isfile(os.path.join(other, "b.txt")))
 
     def test_deploy_mod_physical_mode_replaces_copy(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -243,6 +264,74 @@ class DeployUtilsTests(unittest.TestCase):
 
             self.assertTrue(deploy_mod(src, dst, True, _strict_remove, None))
             self.assertEqual(os.listdir(dst), ["new.txt"])
+
+    def test_deploy_mod_physical_mode_leaves_no_staging_folder(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            src = os.path.join(temp_dir, "cache", "123")
+            _write(os.path.join(src, "new.txt"))
+            game = os.path.join(temp_dir, "game")
+            dst = os.path.join(game, "mods", "123")
+
+            self.assertTrue(deploy_mod(src, dst, True, _strict_remove, None))
+            self.assertEqual(os.listdir(dst), ["new.txt"])
+            self.assertEqual(sorted(os.listdir(game)), ["mods"])
+
+    def test_deploy_mod_physical_mode_keeps_old_copy_when_copy_fails(self):
+        # Regression: an interrupted copy used to leave a half-written mod.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            src = os.path.join(temp_dir, "cache", "123")
+            _write(os.path.join(src, "new.txt"))
+            dst = os.path.join(temp_dir, "game", "mods", "123")
+            _write(os.path.join(dst, "old.txt"))
+
+            import shutil
+            from unittest import mock
+
+            with mock.patch.object(shutil, "copytree", side_effect=OSError("disk full")):
+                with self.assertRaises(OSError):
+                    deploy_mod(src, dst, True, _strict_remove, None)
+            self.assertEqual(os.listdir(dst), ["old.txt"])
+
+    def test_partial_copy_path_is_outside_mods_folder(self):
+        dst = os.path.join(os.sep, "game", "mods", "123")
+        staging = get_partial_copy_path(dst)
+        self.assertEqual(os.path.dirname(staging), os.path.join(os.sep, "game"))
+        self.assertTrue(os.path.basename(staging).startswith("."))
+
+    def test_get_mods_dir_rejects_empty_and_relative_paths(self):
+        with self.assertRaises(ValueError):
+            get_mods_dir("")
+        with self.assertRaises(ValueError):
+            get_mods_dir("relative/game")
+        absolute = os.path.abspath("game")
+        self.assertEqual(get_mods_dir(absolute), os.path.join(absolute, "mods"))
+
+    @unittest.skipIf(os.name == "nt", "symlinks need privileges on Windows")
+    def test_find_links_into_and_dangling_links(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            cache = os.path.join(temp_dir, "cache")
+            steam = os.path.join(temp_dir, "steam")
+            _write(os.path.join(cache, "1", "a"))
+            _write(os.path.join(steam, "2", "a"))
+            mods = os.path.join(temp_dir, "mods")
+            os.makedirs(mods)
+            _symlink(os.path.join(cache, "1"), os.path.join(mods, "1"))
+            _symlink(os.path.join(steam, "2"), os.path.join(mods, "2"))
+            _symlink(os.path.join(cache, "gone"), os.path.join(mods, "3"))
+            _write(os.path.join(mods, "4", "local.txt"))
+
+            self.assertEqual(
+                find_links_into(mods, cache, os.path.islink),
+                [os.path.join(mods, "1"), os.path.join(mods, "3")],
+            )
+            self.assertEqual(find_dangling_links(mods, os.path.islink), ["3"])
+
+    def test_is_directory_writable(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            self.assertTrue(is_directory_writable(temp_dir))
+            self.assertEqual(os.listdir(temp_dir), [])
+            self.assertFalse(is_directory_writable(os.path.join(temp_dir, "missing")))
+            self.assertFalse(is_directory_writable(""))
 
     def test_deploy_mod_missing_source(self):
         with tempfile.TemporaryDirectory() as temp_dir:
